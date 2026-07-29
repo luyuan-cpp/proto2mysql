@@ -1,6 +1,7 @@
 package proto2mysql
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -2471,5 +2472,164 @@ func TestBuildAlterClausesRenameByFieldNumber(t *testing.T) {
 	// ip 已按字段号改名，不应再被误判为新增（否则旧数据丢失）
 	if strings.Contains(joined, "ADD COLUMN `ip` ") {
 		t.Errorf("ip 已按字段号改名，不应再 ADD: %s", joined)
+	}
+}
+
+// TestBinaryFieldRawStorage 端到端验证二进制字段以 proto 裸字节落库（不是 Base64）：
+// 直接读列长度与列内容，与应用层 proto.Marshal 的结果逐字节比对。
+// 这条锁住的是存储格式契约——改了它，已在库里的行就读不出来了。
+func TestBinaryFieldRawStorage(t *testing.T) {
+	cfg := GetMysqlConfig()
+	if cfg == nil || !cfg.InterpolateParams {
+		t.Fatal("本测试必须覆盖 go-sql-driver interpolateParams=true 路径")
+	}
+
+	pdb := NewDB()
+	db := mustOpenTestDB(t, pdb)
+	defer closeTestDB(t, db)
+
+	msg := &testpb.GolangTest{}
+	pdb.RegisterTable(msg)
+	recreateTestTable(t, db, pdb, msg)
+
+	sub := &testpb.Player{PlayerId: 1 << 62, Name: "玩家名"}
+	want, err := proto.Marshal(sub)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	row := &testpb.GolangTest{Id: 1, Ip: "10.0.0.1", Port: 3306, Player: sub}
+	if err := pdb.Insert(row); err != nil {
+		t.Fatalf("插入失败: %v", err)
+	}
+
+	// 列里存的必须是裸字节：长度等于 Marshal 结果，Base64 会是它的 4/3
+	var stored []byte
+	q := "SELECT `player` FROM " + testTableSQLName(msg) + " WHERE `id` = 1"
+	if err := db.QueryRow(q).Scan(&stored); err != nil {
+		t.Fatalf("读列失败: %v", err)
+	}
+	if !bytes.Equal(stored, want) {
+		t.Fatalf("列内容不是 proto 裸字节\n实际 %d 字节: %x\n期望 %d 字节: %x",
+			len(stored), stored, len(want), want)
+	}
+
+	// 不经本库、直接对列做 Unmarshal 也应成功（这正是手写 SQL 侧的读法）
+	var direct testpb.Player
+	if err := proto.Unmarshal(stored, &direct); err != nil {
+		t.Fatalf("列内容应可被直接 Unmarshal: %v", err)
+	}
+	if !proto.Equal(sub, &direct) {
+		t.Errorf("直接反序列化不一致: %s vs %s", sub.String(), direct.String())
+	}
+
+	// 再走本库读回，确认对称
+	loaded := &testpb.GolangTest{Id: 1}
+	if err := pdb.FindOneByPK(loaded); err != nil {
+		t.Fatalf("按主键读回失败: %v", err)
+	}
+	if !proto.Equal(sub, loaded.Player) {
+		t.Errorf("读回不一致: %s vs %s", sub.String(), loaded.Player.String())
+	}
+
+	// 驱动插值模式下 string 参数也必须能把任意字节逐字节写进 BLOB。
+	// 覆盖 NUL、0xff、续字节和非法 UTF-8，防止连接字符集悄悄转换或拒绝数据。
+	arbitrary := []byte{0x00, 0xff, 0x80, 0xc3, 0x28, 0x00}
+	update := "UPDATE " + testTableSQLName(msg) + " SET `player` = ? WHERE `id` = 1"
+	if _, err := db.Exec(update, string(arbitrary)); err != nil {
+		t.Fatalf("插值模式写入任意二进制失败: %v", err)
+	}
+	stored = nil
+	if err := db.QueryRow(q).Scan(&stored); err != nil {
+		t.Fatalf("读取任意二进制失败: %v", err)
+	}
+	if !bytes.Equal(stored, arbitrary) {
+		t.Fatalf("任意二进制未逐字节保留\n实际: %x\n期望: %x", stored, arbitrary)
+	}
+}
+
+// TestSQLBuilderMySQLExecution 在真实 MySQL 上冒烟执行 Builder 的关键语法，
+// 覆盖 ON DUPLICATE KEY、FOR UPDATE、表达式更新、扣减守卫和 ORDER BY ... LIMIT 批删。
+func TestSQLBuilderMySQLExecution(t *testing.T) {
+	pdb := NewDB()
+	db := mustOpenTestDB(t, pdb)
+	defer closeTestDB(t, db)
+
+	model := &testpb.GolangTest{}
+	pdb.RegisterTable(model)
+	recreateTestTable(t, db, pdb, model)
+	b := NewSQLBuilder(model)
+
+	row := &testpb.GolangTest{Id: 101, Ip: "builder", Port: 10, GroupId: 1}
+	stmt, err := b.Insert(row)
+	if err != nil {
+		t.Fatalf("生成 INSERT: %v", err)
+	}
+	if _, err := db.Exec(stmt.Sql, stmt.Args...); err != nil {
+		t.Fatalf("执行 INSERT: %v", err)
+	}
+
+	stmt, err = b.UpsertAdd(&testpb.GolangTest{Id: 101, Port: 5}, "port")
+	if err != nil {
+		t.Fatalf("生成 UPSERT ADD: %v", err)
+	}
+	if _, err := db.Exec(stmt.Sql, stmt.Args...); err != nil {
+		t.Fatalf("执行 UPSERT ADD: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("开启事务: %v", err)
+	}
+	stmt, err = b.SelectColumns([]string{"port"}, "`id` = ?", []interface{}{101}, QueryOptions{ForUpdate: true})
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("生成 SELECT FOR UPDATE: %v", err)
+	}
+	var port int64
+	if err := tx.QueryRow(stmt.Sql, stmt.Args...).Scan(&port); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("执行 SELECT FOR UPDATE: %v", err)
+	}
+	if port != 15 {
+		_ = tx.Rollback()
+		t.Fatalf("UPSERT ADD 后 port=%d，期望 15", port)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交事务: %v", err)
+	}
+
+	stmt, err = b.UpdateAssignsWhere([]Assign{AddCol("port", 2)}, "`id` = ?", []interface{}{101})
+	if err != nil {
+		t.Fatalf("生成表达式 UPDATE: %v", err)
+	}
+	if _, err := db.Exec(stmt.Sql, stmt.Args...); err != nil {
+		t.Fatalf("执行表达式 UPDATE: %v", err)
+	}
+
+	stmt, err = b.DecrByPKIfEnough(&testpb.GolangTest{Id: 101}, "port", 3)
+	if err != nil {
+		t.Fatalf("生成守卫扣减: %v", err)
+	}
+	result, err := db.Exec(stmt.Sql, stmt.Args...)
+	if err != nil {
+		t.Fatalf("执行守卫扣减: %v", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		t.Fatalf("守卫扣减 RowsAffected=%d err=%v，期望 1", affected, err)
+	}
+
+	stmt, err = b.DeleteWhereLimit("`id` = ?", []interface{}{101}, "`id` ASC", 1)
+	if err != nil {
+		t.Fatalf("生成有界 DELETE: %v", err)
+	}
+	result, err = db.Exec(stmt.Sql, stmt.Args...)
+	if err != nil {
+		t.Fatalf("执行有界 DELETE: %v", err)
+	}
+	affected, err = result.RowsAffected()
+	if err != nil || affected != 1 {
+		t.Fatalf("有界 DELETE RowsAffected=%d err=%v，期望 1", affected, err)
 	}
 }

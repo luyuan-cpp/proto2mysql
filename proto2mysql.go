@@ -1324,6 +1324,10 @@ func (p *DB) UpdateFieldsIfVersion(message proto.Message, versionField string, f
 
 // GetReplaceSQLWithArgs 生成参数化的REPLACE语句
 func (m *MessageTable) GetReplaceSQLWithArgs(message proto.Message) (*SqlWithArgs, error) {
+	if err := m.validateMessageDescriptor(message); err != nil {
+		return nil, err
+	}
+
 	var args []interface{}
 	for i := 0; i < m.Descriptor.Fields().Len(); i++ {
 		fieldDesc := m.Descriptor.Fields().Get(i)
@@ -1342,6 +1346,10 @@ func (m *MessageTable) GetReplaceSQLWithArgs(message proto.Message) (*SqlWithArg
 
 // GetUpdateSetWithArgs 生成参数化的SET子句和参数（仅包含已设置的字段）
 func (m *MessageTable) GetUpdateSetWithArgs(message proto.Message) (string, []interface{}, error) {
+	if err := m.validateMessageDescriptor(message); err != nil {
+		return "", nil, err
+	}
+
 	reflection := message.ProtoReflect()
 	var clauses []string
 	var args []interface{}
@@ -1766,14 +1774,17 @@ func (p *DB) FindMultiByWhereClause(message proto.Message, whereClause string) e
 	return p.FindAllByWhereClause(message, whereClause)
 }
 
-// QueryOptions 查询修饰选项，对应MySQL的ORDER BY / LIMIT / OFFSET
+// QueryOptions 查询修饰选项，对应MySQL的ORDER BY / LIMIT / OFFSET / FOR UPDATE
 type QueryOptions struct {
 	OrderBy string // 排序表达式，如 "id DESC"（直接拼入SQL，勿传入不可信输入）
 	Limit   int    // 返回行数上限，<=0表示不限制
 	Offset  int    // 跳过的行数，仅在Limit>0时生效
+	// ForUpdate 追加FOR UPDATE行锁（只在事务内有意义，事务外单句自动提交，锁即刻释放）。
+	// 用于“先锁后改”：读到加锁后的最新值，防止并发读-改-写丢更新
+	ForUpdate bool
 }
 
-// sqlSuffix 生成ORDER BY/LIMIT/OFFSET后缀（以空格开头，可能为空串）
+// sqlSuffix 生成ORDER BY/LIMIT/OFFSET/FOR UPDATE后缀（以空格开头，可能为空串）
 func (o QueryOptions) sqlSuffix() string {
 	var b strings.Builder
 	if o.OrderBy != "" {
@@ -1787,6 +1798,9 @@ func (o QueryOptions) sqlSuffix() string {
 			b.WriteString(" OFFSET ")
 			b.WriteString(strconv.Itoa(o.Offset))
 		}
+	}
+	if o.ForUpdate {
+		b.WriteString(" FOR UPDATE")
 	}
 	return b.String()
 }

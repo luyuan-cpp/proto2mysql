@@ -219,6 +219,115 @@ if err := pbDB.SyncAllTables(); err != nil {
 #### 删除
 - `Delete(message proto.Message) error`: 按主键删除记录
 
+## 只生成 SQL、不执行（SQLBuilder）
+
+`SQLBuilder` 从一个 `proto.Message` 直接产出参数化的 **DML** 语句（INSERT / SELECT / UPDATE /
+DELETE），**不连库、不需要 `RegisterTable`、不执行任何语句**。适合把语句交给已有的 `*sql.DB` /
+`*sql.Tx` / sqlx / kratos data 层自己执行、在事务里和手写 SQL 混用、或先打日志再执行。
+
+（`sqlgen.go` 里的 `GenerateCreateTableSQL` / `GenerateMigrationSQL` 负责 DDL，本节负责 DML。）
+
+```go
+b := proto2mysql.NewSQLBuilder(&pb.PlayerCurrency{})   // 表配置自动读 proto option
+// 或复用已注册表的配置：b, err := pbDB.SQLBuilder(&pb.PlayerCurrency{})
+
+stmt, err := b.UpsertAdd(row, "gold")   // 插入或累加
+// stmt.Sql  = INSERT INTO `player_currency` (...) VALUES (?, ?)
+//             ON DUPLICATE KEY UPDATE `gold` = `gold` + VALUES(`gold`)
+// stmt.Args = [...]
+if _, err := tx.ExecContext(ctx, stmt.Sql, stmt.Args...); err != nil { ... }
+```
+
+### 接口一览
+
+| 分类 | 方法 | 产出 |
+|------|------|------|
+| INSERT | `Insert` | 全字段插入 |
+| | `InsertSetFields` | 只插已赋值字段，其余交给列默认值（自增 id / `DEFAULT CURRENT_TIMESTAMP`） |
+| | `InsertIgnore` / `InsertIgnoreSetFields` | `INSERT IGNORE`，冲突跳过 |
+| | `Replace` | `REPLACE INTO`（先删后插） |
+| | `BatchInsert` / `BatchInsertIgnore` / `BatchReplace` | 多行 VALUES |
+| UPSERT | `Upsert(m, cols...)` | `ON DUPLICATE KEY UPDATE c = VALUES(c)`，覆盖 |
+| | `UpsertAdd(m, cols...)` | `c = c + VALUES(c)`，累加计数器 |
+| | `UpsertKeepOld(m)` | `pk = pk`，插入或只加行锁不改数据 |
+| | `UpsertWith(m, assigns...)` | 自定义冲突合并语义 |
+| | `BatchUpsert` / `BatchUpsertWith` | 批量版 |
+| SELECT | `SelectByPK` / `SelectByPKForUpdate` | 按主键查整行（后者带 `FOR UPDATE` 行锁） |
+| | `SelectWhere(where, args, opts)` | 条件查询 + `ORDER BY` / `LIMIT` / `OFFSET` / `FOR UPDATE` |
+| | `SelectColumns(cols, ...)` | 只查指定列（列名校验+转义） |
+| | `SelectByKVIn` / `SelectByPKIn` | `IN (?, ?, ...)`，占位符按取值个数展开 |
+| | `Count` / `Exists` / `ExistsByPKForUpdate` | `COUNT(*)` / `SELECT 1 ... LIMIT 1` |
+| UPDATE | `UpdateByPK` / `UpdateWhere` | 更新已赋值字段 |
+| | `UpdateByPKIf(m, guard, args)` | CAS：`WHERE pk = ? AND <guard>` |
+| | `UpdateFieldsByPK(m, cols...)` | 只更新指定列（零值也照写，用于清零） |
+| | `UpdateAssignsByPK` / `UpdateAssignsWhere` | 表达式更新，如 `gold = gold + ?` |
+| | `IncrByPK` / `DecrByPKIfEnough` | 原子加 / 够才扣（`AND col >= ?`，防负数） |
+| DELETE | `DeleteByPK` / `DeleteByPKIf` / `DeleteWhere` | 按主键 / 带守卫 / 按条件删除 |
+| | `DeleteWhereLimit(where, args, orderBy, n)` | 有界批删，保留期清理用 |
+| | `DeleteByKVIn` / `DeleteByPKIn` | `IN (?, ?, ...)` 批删 |
+| 其它 | `TableName` / `Table` / `CreateTable` / `PrimaryKeyWhere` | 表名 / 底层映射 / 建表语句 / 主键 WHERE 片段 |
+
+### 赋值子句 Assign
+
+`UpsertWith` / `UpdateAssignsByPK` / `UpdateAssignsWhere` 的更新部分由 `Assign` 描述，
+构造函数分两类：
+
+通用（UPDATE 和 UPSERT 都可用）：
+
+| 构造 | 产出 |
+|------|------|
+| `SetCol(col, val)` | `col = ?` |
+| `AddCol(col, delta)` | `col = col + ?` |
+| `SubCol(col, delta)` | `col = col - ?` |
+| `SetColExpr(col, expr, args...)` | `col = <expr>`，如 `"NOW()"` |
+
+仅用于 UPSERT（`VALUES(col)` = 本次本该插入的新值）：
+
+| 构造 | 产出 | 语义 |
+|------|------|------|
+| `SetNew(col)` | `col = VALUES(col)` | 覆盖 |
+| `AddNew(col)` | `col = col + VALUES(col)` | 累加 |
+| `MinNew(col)` / `MaxNew(col)` | `LEAST` / `GREATEST` | 取最值（退避时间取更早 / 水位只增不减） |
+| `SetNewIfZero(col)` | `col = IF(col = 0, VALUES(col), col)` | 首写生效，已写过不覆盖 |
+| `KeepOld(col)` | `col = col` | 不改数据，只拿行锁 |
+
+```go
+// 冲突时：代次 +1、jti 换新、首次落的时间戳不被覆盖
+stmt, err := b.UpsertWith(row,
+    proto2mysql.SetColExpr("generation", "`generation` + 1"),
+    proto2mysql.SetNew("sess_jti"),
+    proto2mysql.SetNewIfZero("first_seen_ms"))
+
+// 余额够才扣，靠 RowsAffected 判定成败
+stmt, err = b.DecrByPKIfEnough(row, "gold", 100)
+
+// 保留期清理：小批量循环删到 RowsAffected < limit
+stmt, err = b.DeleteWhereLimit("`created_at` < ?", []interface{}{cutoff}, "", 1000)
+```
+
+### 注意事项
+
+- 返回的 SQL **不带结尾分号**，`Args` 与 `?` 一一对应，直接给 `Exec` / `Query` 用；
+- 列名一律校验存在于该 message 并加反引号转义，未知列返回 `ErrFieldNotFound`；
+- **UPDATE / DELETE 不接受空条件**：`UpdateWhere` / `UpdateAssignsWhere` / `DeleteWhere` /
+  `DeleteWhereLimit` 传空串会返回 `ErrEmptyWhereClause`，而不是悄悄退化成整表操作。
+  确需操作全表时必须显式传 `"1=1"`，让危险意图在代码评审里看得见。
+  （SELECT 侧的 `SelectWhere` / `Count` / `Exists` 没有这个限制，空条件仍按全表查询处理。）
+- `whereClause`、`QueryOptions.OrderBy`、`DeleteWhereLimit.orderBy`、
+  `UpdateByPKIf` / `DeleteByPKIf` 的 guard、以及 `SetColExpr` 的表达式都是
+  **原样拼接的裸 SQL**，只能来自代码常量，取值一律走 `Args`；
+- `UpsertAdd` 必须显式指定数值列；不传列或传入 string/BLOB 等非数值列会返回错误，
+  防止 MySQL 隐式数值转换写坏数据；
+- **proto3 零值 = 未赋值**：`InsertSetFields` / `UpdateByPK` 只写 `Has()` 为真的字段，
+  标量字段值为 `0` / `""` / `false` 时会被跳过。要显式写零值，把字段声明为 `optional`，
+  或改用 `Insert` / `UpdateFieldsByPK`；
+- `FOR UPDATE` 只在事务内有意义（事务外单句自动提交，锁立即释放）；
+- CAS 类语句执行后应检查 `RowsAffected`。其中正数扣减/删除返回 0 表示条件未命中；
+  `UpdateByPKIf` 在默认 MySQL 配置下返回 0 还可能表示“条件命中但新旧值相同”。必须区分时，
+  让语句同时递增版本列，或启用 `clientFoundRows=true` 后按匹配行数判断；
+- `VALUES()` 在 MySQL 8.0.20 起被标记 deprecated（官方建议改 `AS new` 行别名），至今仍可用，
+  本库沿用它以兼容 5.7。
+
 ## 类型映射
 
 | Protobuf 类型 | MySQL 类型 | 说明 |
@@ -231,12 +340,39 @@ if err := pbDB.SyncAllTables(); err != nil {
 | double       | double NOT NULL DEFAULT 0 | - |
 | bool         | tinyint(1) NOT NULL DEFAULT 0 | - |
 | string       | MEDIUMTEXT | - |
-| bytes        | MEDIUMBLOB | - |
+| bytes        | MEDIUMBLOB | 原样存储，不做编码 |
 | enum         | int NOT NULL DEFAULT 0 | 存储枚举值的数字表示 |
-| message      | MEDIUMBLOB | 序列化存储 |
-| map          | MEDIUMBLOB | 序列化存储 |
-| repeated     | MEDIUMBLOB | 序列化存储 |
+| message      | MEDIUMBLOB | proto wire 格式**裸字节** |
+| map          | MEDIUMBLOB | proto wire 格式**裸字节** |
+| repeated     | MEDIUMBLOB | proto wire 格式**裸字节** |
 | Timestamp    | DATETIME | 自动处理时间格式转换 |
+
+### 二进制字段的存储格式（裸字节，不是 Base64）
+
+`bytes` / 嵌套 message / `map` / `repeated` 一律以 **proto wire 格式的裸字节**落库，
+与手写 `proto.Marshal(v)` 后直接 `Exec(sql, blob)` 的结果**逐字节相同**。因此这些列可以和
+不经本库的手写 SQL 混用：别处写的行本库读得出来，本库写的行别处也读得出来。
+
+不做 Base64 的原因：目标列是 `MEDIUMBLOB`，本身二进制安全，Base64 只会白白多占 33% 体积
+（实测 8238 B → 10984 B），并在每次读写上加一次编解码与一次分配。要在 SQL 控制台查看内容，
+用 MySQL 自带的 `TO_BASE64()` 即可，不必为此付出存储代价：
+
+```sql
+SELECT TO_BASE64(`player`) FROM `golang_test` WHERE `id` = 1;
+```
+
+> ⚠️ **列类型必须是 BLOB 系**。裸字节写进 utf8mb4 的 `TEXT` / `VARCHAR` 列会因非法 UTF-8
+> 被拒或损坏。本库建表时这几类字段统一映射为 `MEDIUMBLOB`，只有手工建的表才可能踩到。
+
+> ⚠️ **从 Base64 版本升级**：早期版本把这些字段编码成 Base64 落库。升级后写入格式变了，
+> 存量行必须先就地还原，否则读出来会 `cannot parse invalid wire-format data`：
+>
+> ```sql
+> UPDATE `表名` SET `列名` = FROM_BASE64(`列名`);
+> ```
+>
+> 迁移期间**不要**让新旧两个版本同时读写同一张表（新版本写的裸字节，旧版本会当 Base64 解码
+> 而失败）。要灰度并存，得先加新列双写、读侧兼容两种格式，验证后再切、再删旧列。
 
 ## 配置选项
 

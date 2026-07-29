@@ -1,7 +1,6 @@
 package pbconv
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
@@ -12,10 +11,18 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// SerializeFieldAsString 将消息中的单个字段序列化为字符串：
+// SerializeFieldAsString 将消息中的单个字段序列化为可直接下发给MySQL的值：
 //   - Timestamp        -> "2006-01-02 15:04:05"
-//   - map/list/bytes/嵌套消息 -> proto wire格式 + Base64
+//   - map/list/bytes/嵌套消息 -> proto wire格式**裸字节**（装在string里，非UTF-8文本）
 //   - 标量             -> 十进制/布尔字符串
+//
+// 二进制字段不做Base64：目标列是MEDIUMBLOB，本身二进制安全，编码只会白白多占33%体积
+// 并在每次读写上加一次编解码。Go的string可承载任意字节，驱动以参数下发时逐字节无损，
+// 因此返回类型仍是string。要在SQL控制台查看，用MySQL自带的TO_BASE64(列)。
+//
+// ⚠️ 这些字段对应的列必须是二进制类型（BLOB系）。写进utf8mb4的TEXT/VARCHAR列会因
+// 非法UTF-8被拒或损坏——本库建表时bytes/message/map/list统一映射为MEDIUMBLOB，
+// 只有手工建的表才可能踩到。
 func SerializeFieldAsString(message proto.Message, fieldDesc protoreflect.FieldDescriptor) (string, error) {
 	reflection := message.ProtoReflect()
 
@@ -38,11 +45,17 @@ func SerializeFieldAsString(message proto.Message, fieldDesc protoreflect.FieldD
 	case protoreflect.StringKind:
 		return reflection.Get(fieldDesc).String(), nil
 	case protoreflect.BoolKind:
-		return strconv.FormatBool(reflection.Get(fieldDesc).Bool()), nil
+		// 必须是 "1"/"0" 而不是 "true"/"false"：目标列是 tinyint(1)，
+		// 在 STRICT_TRANS_TABLES 下写 'true' 会被拒（Error 1366 Incorrect integer value）。
+		// 读侧 strconv.ParseBool 同时吃 "1"/"0" 与 "true"/"false"，所以对存量行向后兼容。
+		if reflection.Get(fieldDesc).Bool() {
+			return "1", nil
+		}
+		return "0", nil
 	case protoreflect.EnumKind:
 		return strconv.FormatInt(int64(reflection.Get(fieldDesc).Enum()), 10), nil
 	case protoreflect.BytesKind:
-		return base64.StdEncoding.EncodeToString(reflection.Get(fieldDesc).Bytes()), nil
+		return string(reflection.Get(fieldDesc).Bytes()), nil
 	case protoreflect.MessageKind:
 		if !reflection.Has(fieldDesc) {
 			return "", nil
@@ -51,7 +64,7 @@ func SerializeFieldAsString(message proto.Message, fieldDesc protoreflect.FieldD
 		if err != nil {
 			return "", fmt.Errorf("marshal sub-message field %s: %w", fieldDesc.Name(), err)
 		}
-		return base64.StdEncoding.EncodeToString(data), nil
+		return string(data), nil
 	default:
 		return "", fmt.Errorf("%w: %v (field: %s)", ErrInvalidFieldKind, fieldDesc.Kind(), fieldDesc.Name())
 	}
@@ -73,7 +86,7 @@ func serializeTimestamp(reflection protoreflect.Message, fieldDesc protoreflect.
 }
 
 // serializeContainer 序列化map/list字段：将字段放入一个同类型的空消息中，
-// 用标准proto wire格式编码后再Base64，保证与parseContainer对称可逆。
+// 用标准proto wire格式编码为裸字节，保证与parseContainer对称可逆。
 func serializeContainer(reflection protoreflect.Message, fieldDesc protoreflect.FieldDescriptor) (string, error) {
 	if !reflection.Has(fieldDesc) {
 		return "", nil
@@ -84,7 +97,7 @@ func serializeContainer(reflection protoreflect.Message, fieldDesc protoreflect.
 	if err != nil {
 		return "", fmt.Errorf("serialize field %s: %w", fieldDesc.Name(), err)
 	}
-	return base64.StdEncoding.EncodeToString(data), nil
+	return string(data), nil
 }
 
 var (
@@ -198,19 +211,12 @@ func setFieldFromString(reflection protoreflect.Message, fieldDesc protoreflect.
 		}
 		reflection.Set(fieldDesc, protoreflect.ValueOfEnum(protoreflect.EnumNumber(val)))
 	case protoreflect.BytesKind:
-		data, err := base64.StdEncoding.DecodeString(raw)
-		if err != nil {
-			return fmt.Errorf("decode bytes field %s: %w", fieldName, err)
-		}
-		reflection.Set(fieldDesc, protoreflect.ValueOfBytes(data))
+		reflection.Set(fieldDesc, protoreflect.ValueOfBytes([]byte(raw)))
 	case protoreflect.MessageKind:
-		data, err := base64.StdEncoding.DecodeString(raw)
-		if err != nil {
-			return fmt.Errorf("decode sub-message field %s: %w", fieldName, err)
-		}
 		subMsg := reflection.Mutable(fieldDesc).Message()
-		if err := proto.Unmarshal(data, subMsg.Interface()); err != nil {
-			return fmt.Errorf("unmarshal sub-message field %s: %w (value: %s)", fieldName, err, raw)
+		// 出错时不打raw：里面是proto裸字节，直接进日志会喷控制字符
+		if err := proto.Unmarshal([]byte(raw), subMsg.Interface()); err != nil {
+			return fmt.Errorf("unmarshal sub-message field %s: %w (%d bytes)", fieldName, err, len(raw))
 		}
 	default:
 		return fmt.Errorf("%w: %v (field: %s)", ErrInvalidFieldKind, fieldDesc.Kind(), fieldName)
@@ -243,14 +249,9 @@ func parseContainer(reflection protoreflect.Message, fieldDesc protoreflect.Fiel
 	if raw == "" {
 		return nil
 	}
-	data, err := base64.StdEncoding.DecodeString(raw)
-	if err != nil {
-		return fmt.Errorf("decode field %s: %w (value: %s)", fieldDesc.Name(), err, raw)
-	}
-
 	holder := reflection.New()
-	if err := proto.Unmarshal(data, holder.Interface()); err != nil {
-		return fmt.Errorf("parse field %s: %w", fieldDesc.Name(), err)
+	if err := proto.Unmarshal([]byte(raw), holder.Interface()); err != nil {
+		return fmt.Errorf("parse field %s: %w (%d bytes)", fieldDesc.Name(), err, len(raw))
 	}
 	if !holder.Has(fieldDesc) {
 		return nil

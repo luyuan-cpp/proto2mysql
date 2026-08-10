@@ -18,7 +18,8 @@ package proto2mysql
 // 约定：
 //   - 返回的 SQL **不带结尾分号**（直接给 Exec/Query 用）；
 //   - 列名一律经 escapeMySQLName 转义，并校验存在于该 message，非法列名返回 ErrFieldNotFound；
-//   - 消息取值沿用 pbconv.SerializeFieldAsString（与 Insert/Update 一致，全部以字符串下发，MySQL 侧隐式转换）；
+//   - 消息取值沿用 pbconv.SerializeFieldValue（与 Insert/Update 一致：标量以字符串下发由 MySQL 侧隐式转换，
+//     未设置的 Timestamp 下发 SQL NULL）；
 //   - whereClause / OrderBy / SetColExpr 的表达式是原样拼接的裸 SQL，**不得传入不可信输入**。
 
 import (
@@ -409,7 +410,7 @@ func (b *SQLBuilder) setFieldColumns(m proto.Message) ([]string, []interface{}, 
 		if !reflection.Has(field) {
 			continue
 		}
-		val, err := pbconv.SerializeFieldAsString(m, field)
+		val, err := pbconv.SerializeFieldValue(m, field)
 		if err != nil {
 			return nil, nil, fmt.Errorf("serialize field %s: %w", field.Name(), err)
 		}
@@ -568,7 +569,7 @@ func (b *SQLBuilder) UpdateFieldsByPK(m proto.Message, cols ...string) (*SqlWith
 		if !ok {
 			return nil, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, col, b.table.tableName)
 		}
-		val, err := pbconv.SerializeFieldAsString(m, field)
+		val, err := pbconv.SerializeFieldValue(m, field)
 		if err != nil {
 			return nil, fmt.Errorf("serialize field %s: %w", col, err)
 		}

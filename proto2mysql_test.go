@@ -13,11 +13,17 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	testpb "github.com/luyuancpp/proto2mysql/internal/testpb"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const integrationEnv = "PROTO2MYSQL_INTEGRATION"
@@ -145,6 +151,57 @@ func TestAlterTable(t *testing.T) {
 		t.Fatalf("执行ALTER TABLE失败: %v", err)
 	}
 	t.Log("ALTER TABLE成功")
+}
+
+// TestCreateOrUpdateTableBackfillsMissingPrimaryKey 锁死"缺主键的存量表会被
+// CreateOrUpdateTable 自动补上主键"这一行为。回归的是历史坑:老版本 proto（或
+// 一份缺主键的手工 DDL）建过的表永远补不上主键,而写路径 INSERT ... ON DUPLICATE
+// KEY UPDATE 依赖主键判重,无主键时退化成每次 INSERT 新行 → 静默串档。
+func TestCreateOrUpdateTableBackfillsMissingPrimaryKey(t *testing.T) {
+	pdb := NewDB()
+	testTable := &testpb.GolangTest{}
+	pdb.RegisterTable(testTable)
+
+	db := mustOpenTestDB(t, pdb)
+	defer closeTestDB(t, db)
+
+	tableName := GetTableName(testTable)
+	escaped := escapeMySQLName(tableName)
+
+	// 从干净起点出发,建一张**故意不带主键**的同名表(模拟陈旧 DDL 建的表)。
+	if _, err := db.Exec("DROP TABLE IF EXISTS " + escaped); err != nil {
+		t.Fatalf("清理旧表失败: %v", err)
+	}
+	if _, err := db.Exec("CREATE TABLE " + escaped + " (id BIGINT NOT NULL DEFAULT 0)"); err != nil {
+		t.Fatalf("建无主键表失败: %v", err)
+	}
+
+	hasPK, err := pdb.tableHasPrimaryKey(tableName)
+	if err != nil {
+		t.Fatalf("检查主键失败: %v", err)
+	}
+	if hasPK {
+		t.Fatal("前置条件不成立:新建的无主键表却报告有主键")
+	}
+
+	// 同步:应补齐列 + 补上主键。
+	if err := pdb.CreateOrUpdateTable(testTable); err != nil {
+		t.Fatalf("CreateOrUpdateTable 失败: %v", err)
+	}
+
+	hasPK, err = pdb.tableHasPrimaryKey(tableName)
+	if err != nil {
+		t.Fatalf("补键后检查主键失败: %v", err)
+	}
+	if !hasPK {
+		t.Fatal("CreateOrUpdateTable 没有补上缺失的主键")
+	}
+
+	// 幂等:已有主键时再次同步不应报错、也不重复加。
+	if err := pdb.CreateOrUpdateTable(testTable); err != nil {
+		t.Fatalf("已有主键时再次 CreateOrUpdateTable 失败: %v", err)
+	}
+	t.Log("缺失主键回填成功且幂等")
 }
 
 // TestLoadSave 测试单条数据存/取
@@ -2631,5 +2688,159 @@ func TestSQLBuilderMySQLExecution(t *testing.T) {
 	affected, err = result.RowsAffected()
 	if err != nil || affected != 1 {
 		t.Fatalf("有界 DELETE RowsAffected=%d err=%v，期望 1", affected, err)
+	}
+}
+
+// TestDatetimePrecisionMigration DATETIME 的小数秒精度必须参与类型比对，
+// 否则存量表停在 DATETIME(0)，SyncAllTables 认为"已匹配"而不生成 ALTER，
+// 写入的毫秒继续被静默丢掉——精度改了等于没改。
+func TestDatetimePrecisionMigration(t *testing.T) {
+	cases := []struct {
+		current, target string
+		want            bool
+		why             string
+	}{
+		{"datetime", "DATETIME(6)", false, "老表精度不足，必须 ALTER"},
+		{"datetime(0)", "DATETIME(6)", false, "显式 fsp=0 同样要 ALTER"},
+		{"datetime(3)", "DATETIME(6)", false, "毫秒精度不够，要升到微秒"},
+		{"datetime(6)", "DATETIME(6)", true, "已经一致，不动"},
+		{"timestamp(6)", "DATETIME(6)", true, "timestamp 映射到 datetime，精度一致"},
+		{"datetime(6)", "DATETIME", true, "线上精度更高时不降级（降级会丢数据）"},
+	}
+	for _, c := range cases {
+		if got := isTypeMatch(c.current, c.target); got != c.want {
+			t.Errorf("isTypeMatch(%q, %q) = %v, 期望 %v（%s）", c.current, c.target, got, c.want, c.why)
+		}
+	}
+}
+
+// TestTimestampColumnIsNullableWithPrecision Timestamp 列必须是 DATETIME(6) 且允许 NULL：
+// 精度不足会静默丢毫秒；声明成 NOT NULL 则任何没赋值该字段的行都插不进去。
+func TestTimestampColumnIsNullableWithPrecision(t *testing.T) {
+	md := timestampProbeDescriptor(t)
+	tsDesc := md.Fields().ByName("ts")
+	msg := dynamicpb.NewMessage(md)
+
+	table := newMessageTable(msg.Interface(), WithTableName("ts_probe"))
+	got := table.getMySQLFieldType(tsDesc)
+	if got != "DATETIME(6)" {
+		t.Errorf("Timestamp 列类型应为 DATETIME(6)（可空），实际 %q", got)
+	}
+	if strings.Contains(got, "NOT NULL") {
+		t.Errorf("Timestamp 列不得声明 NOT NULL，否则未赋值的行插不进去: %q", got)
+	}
+
+	// nullable 选项不应改变它（本来就允许 NULL）
+	table2 := newMessageTable(msg.Interface(), WithTableName("ts_probe"), WithNullableFields("ts"))
+	if got2 := table2.getMySQLFieldType(tsDesc); got2 != got {
+		t.Errorf("nullable 选项不应改变 Timestamp 列类型: %q vs %q", got2, got)
+	}
+
+	// 建表语句里也要体现
+	if ddl := table.GetCreateTableSQL(); !strings.Contains(ddl, "`ts` DATETIME(6)") {
+		t.Errorf("建表语句未使用 DATETIME(6):\n%s", ddl)
+	}
+}
+
+// timestampProbeDescriptor 现造一个含 google.protobuf.Timestamp 字段的消息描述符
+func timestampProbeDescriptor(t *testing.T) protoreflect.MessageDescriptor {
+	t.Helper()
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String("ts_probe_ddl.proto"),
+		Package:    proto.String("tsprobeddl"),
+		Syntax:     proto.String("proto3"),
+		Dependency: []string{"google/protobuf/timestamp.proto"},
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("ts_probe"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name: proto.String("ts"), Number: proto.Int32(1),
+				Type:     descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(),
+				Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+				TypeName: proto.String(".google.protobuf.Timestamp"),
+			}},
+		}},
+	}
+	fd, err := protodesc.NewFile(fdp, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatalf("build descriptor: %v", err)
+	}
+	return fd.Messages().Get(0)
+}
+
+// TestTimestampEndToEnd 端到端验证 Timestamp 的两条契约（需真实 MySQL）：
+//  1. 未设置 -> 落 SQL NULL，整行能插进去（旧实现下发空串，STRICT 模式 Error 1292 整行失败）
+//  2. 带毫秒/微秒 -> 精度保留到微秒（旧实现静默截断到整秒）
+func TestTimestampEndToEnd(t *testing.T) {
+	pdb := NewDB()
+	db := mustOpenTestDB(t, pdb)
+	defer closeTestDB(t, db)
+
+	md := timestampProbeDescriptor(t)
+	tsField := md.Fields().ByName("ts")
+	msg := dynamicpb.NewMessage(md)
+
+	const table = "ts_e2e_probe"
+	opts := []TableOption{WithTableName(table)}
+	pdb.RegisterTable(msg.Interface(), opts...)
+
+	if _, err := db.Exec("DROP TABLE IF EXISTS " + escapeMySQLName(table)); err != nil {
+		t.Fatalf("清理表失败: %v", err)
+	}
+	ddl := NewSQLBuilder(msg.Interface(), opts...).CreateTable()
+	if _, err := db.Exec(ddl); err != nil {
+		t.Fatalf("建表失败: %v\n%s", err, ddl)
+	}
+	defer db.Exec("DROP TABLE IF EXISTS " + escapeMySQLName(table))
+
+	// 1) 未设置 Timestamp：必须能插入，且列里是 NULL
+	unset := dynamicpb.NewMessage(md)
+	if err := pdb.Insert(unset.Interface()); err != nil {
+		t.Fatalf("未设置 Timestamp 的行应能插入（应下发 SQL NULL）: %v", err)
+	}
+	var isNull bool
+	if err := db.QueryRow("SELECT `ts` IS NULL FROM " + escapeMySQLName(table)).Scan(&isNull); err != nil {
+		t.Fatalf("读 NULL 状态失败: %v", err)
+	}
+	if !isNull {
+		t.Error("未设置的 Timestamp 应落成 SQL NULL")
+	}
+
+	// 2) 亚秒精度：写入带纳秒的值，微秒必须留下来
+	db.Exec("DELETE FROM " + escapeMySQLName(table))
+	base := time.Date(2026, 7, 29, 12, 34, 56, 123456789, time.UTC)
+	withNanos := dynamicpb.NewMessage(md)
+	withNanos.Set(tsField, protoreflect.ValueOfMessage(timestamppb.New(base).ProtoReflect()))
+	if err := pdb.Insert(withNanos.Interface()); err != nil {
+		t.Fatalf("插入带纳秒的 Timestamp 失败: %v", err)
+	}
+
+	// 用 DATE_FORMAT 取字符串列：测试连接开了 parseTime=true，直接 SELECT `ts`
+	// 会被驱动转成 time.Time，看不到库里真实的文本形态
+	var stored string
+	if err := db.QueryRow("SELECT DATE_FORMAT(`ts`, '%Y-%m-%d %H:%i:%s.%f') FROM " + escapeMySQLName(table)).Scan(&stored); err != nil {
+		t.Fatalf("读列失败: %v", err)
+	}
+	if stored != "2026-07-29 12:34:56.123456" {
+		t.Errorf("列里精度不对: %q（期望保留到微秒）", stored)
+	}
+
+	// 列类型必须真的是 DATETIME(6)，否则精度是靠运气
+	var colType string
+	if err := db.QueryRow(
+		`SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'ts'`, table).Scan(&colType); err != nil {
+		t.Fatalf("读列类型失败: %v", err)
+	}
+	if !strings.EqualFold(colType, "datetime(6)") {
+		t.Errorf("列类型应为 datetime(6)，实际 %q", colType)
+	}
+
+	back := dynamicpb.NewMessage(md)
+	if err := pdb.FindOneByWhereWithArgs(back.Interface(), "`ts` IS NOT NULL", nil); err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	got := back.Get(tsField).Message().Interface().(*timestamppb.Timestamp).AsTime().UTC()
+	if want := base.Truncate(time.Microsecond); !got.Equal(want) {
+		t.Errorf("往返丢精度\n实际: %s\n期望: %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
 	}
 }

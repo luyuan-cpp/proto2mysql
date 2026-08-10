@@ -345,7 +345,35 @@ stmt, err = b.DeleteWhereLimit("`created_at` < ?", []interface{}{cutoff}, "", 10
 | message      | MEDIUMBLOB | proto wire 格式**裸字节** |
 | map          | MEDIUMBLOB | proto wire 格式**裸字节** |
 | repeated     | MEDIUMBLOB | proto wire 格式**裸字节** |
-| Timestamp    | DATETIME | 自动处理时间格式转换 |
+| Timestamp    | DATETIME(6) **（恒定可空）** | 保留到微秒；未设置时落 SQL NULL |
+
+### Timestamp 的两条硬约束
+
+**① 列类型是 `DATETIME(6)`，不是 `DATETIME`。**
+`DATETIME` 等价 `DATETIME(0)`，写入带毫秒/纳秒的时间会被**静默**截断到整秒——不报错、无警告。
+`DATETIME(6)` 保留到微秒；proto `Timestamp` 的纳秒位仍会丢，那是 MySQL 时间类型的硬上限。
+
+存量表（本特性之前建的）停在 `DATETIME(0)`，`UpdateTableField` / `SyncAllTables` 会自动生成
+`MODIFY COLUMN ... DATETIME(6)` 把它升上来；也可以手动：
+
+```sql
+ALTER TABLE `表名` MODIFY `列名` DATETIME(6) NULL;
+```
+
+> 升级前的过渡期请注意：新版本会下发带小数秒的字符串，写进还没迁移的 `DATETIME(0)` 列时
+> MySQL 会**四舍五入**（`.9` 进位到下一秒），而不是像旧版本那样在 Go 侧截断。
+
+**② Timestamp 列恒定允许 NULL，不受 `nullable` 选项影响。**
+proto 的 message 字段天然是"有/无"两态，而 DATETIME 没有可用的零值——`'0000-00-00'` 在
+`NO_ZERO_DATE` 下非法，空串在 `STRICT_TRANS_TABLES` 下直接被拒
+（`Error 1292 Incorrect datetime value: ''`）。若声明成 `NOT NULL`，凡是没给该字段赋值的行
+**整行都插不进去**，等于把这列变成必填。因此未设置的 Timestamp 一律下发 SQL `NULL`。
+
+### 浮点数：NaN / ±Inf 会被拒绝
+
+MySQL 的 `FLOAT`/`DOUBLE` 没有 NaN/Inf 的表示。写入时本库直接返回 `pbconv.ErrNonFiniteFloat`，
+不把问题丢给 MySQL——在 `STRICT` 模式下它只会报 `Error 1265 Data truncated`（完全看不出根因），
+非 `STRICT` 模式下更糟：悄悄存成 `0`，成为静默的数据损坏。
 
 ### 二进制字段的存储格式（裸字节，不是 Base64）
 

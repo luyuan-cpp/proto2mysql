@@ -95,13 +95,15 @@ func buildPlaceholders(count int) string {
 
 // getMySQLFieldType 获取字段对应的MySQL目标类型（支持Timestamp特殊处理）
 func (m *MessageTable) getMySQLFieldType(fieldDesc protoreflect.FieldDescriptor) string {
-	// 特殊处理Timestamp类型
+	// 特殊处理Timestamp类型：
+	//   - DATETIME(6)：不带小数秒精度会把毫秒/纳秒**静默**截断到整秒（不报错、无警告）。
+	//     MySQL时间类型最高到微秒，纳秒位仍会丢，这是MySQL的硬上限。
+	//   - 恒定可空：proto的message字段天然是"有/无"两态，未设置时唯一正确的表示是NULL
+	//     （空串在STRICT模式下被拒，'0000-00-00'在NO_ZERO_DATE下非法）。
+	//     声明成NOT NULL的话，凡是没赋值该字段的行都插不进去，等于把这列变成必填，
+	//     所以这里不受nullable选项影响，一律允许NULL。
 	if fieldDesc.Message() != nil && fieldDesc.Message().FullName() == timestampFullName {
-		fieldName := string(fieldDesc.Name())
-		if m.isNullableField(fieldName) {
-			return "DATETIME"
-		}
-		return "DATETIME NOT NULL"
+		return "DATETIME(6)"
 	}
 
 	if fieldDesc.IsMap() || fieldDesc.IsList() {
@@ -360,6 +362,11 @@ func isTypeMatch(currentType, targetType string) bool {
 	case "float", "double":
 		// 小数位兼容检查
 		return target.decimal >= current.decimal
+	case "datetime":
+		// 括号里的是小数秒精度(fsp)。线上精度低于目标时必须ALTER，
+		// 否则老表停留在DATETIME(0)，写入的毫秒会被静默丢掉——精度修了等于没修。
+		// 线上精度更高时不动它（降精度会丢数据）。
+		return current.length >= target.length
 	}
 
 	return true
@@ -655,17 +662,64 @@ func (p *DB) syncTableSchema(registryKey string, table *MessageTable) error {
 
 	alterSQLs := table.buildAlterClauses(currentCols)
 
-	// 执行ALTER TABLE（如果有需要修改的内容）
+	// 补齐缺失的主键。
+	//
+	// buildAlterClauses 只对齐列（ADD/MODIFY/CHANGE COLUMN），从不看主键。
+	// 主键必须与列变更放进同一条 ALTER：主键列常同时带 AUTO_INCREMENT，若先单独
+	// MODIFY 成 AUTO_INCREMENT、再 ADD PRIMARY KEY，MySQL 会在第一条语句就报
+	// Error 1075（auto column must be defined as a key），永远到不了补主键那一步。
+	// 同一条 ALTER 也保证列对齐与补主键原子成功或失败。
+	//
+	// 这里只补“从无到有”，绝不自动 DROP/改写已有主键。ADD PRIMARY KEY 在已有
+	// 重复行时会失败；这是预期的 fail-closed 行为，调用方必须先人工去重再重试。
+	missingPrimaryKey := false
+	if len(table.primaryKey) > 0 {
+		hasPK, err := p.tableHasPrimaryKey(table.tableName)
+		if err != nil {
+			return fmt.Errorf("检查表 %s 主键存在性: %w", table.tableName, err)
+		}
+		if !hasPK {
+			missingPrimaryKey = true
+			pkCols := make([]string, len(table.primaryKey))
+			for i, pk := range table.primaryKey {
+				pkCols[i] = escapeMySQLName(pk)
+			}
+			alterSQLs = append(alterSQLs, fmt.Sprintf("ADD PRIMARY KEY (%s)", strings.Join(pkCols, ",")))
+			log.Printf("table %s is missing its primary key; adding %s", table.tableName, strings.Join(pkCols, ","))
+		}
+	}
+
+	// 执行ALTER TABLE（如果有需要修改的列或需要补主键）
 	if len(alterSQLs) > 0 {
 		alterSQL := fmt.Sprintf("ALTER TABLE %s %s", escapeMySQLName(table.tableName), strings.Join(alterSQLs, ", "))
 		_, err := p.DB.ExecContext(p.context(), alterSQL)
 		if err != nil {
+			if missingPrimaryKey {
+				return fmt.Errorf("更新表 %s 结构并补齐主键失败(可能存在重复行，需先去重再重试): %w, SQL: %s",
+					table.tableName, err, alterSQL)
+			}
 			return fmt.Errorf("更新表 %s 结构失败: %w, SQL: %s", table.tableName, err, alterSQL)
 		}
 		p.clearColumnCache(registryKey) // 清除缓存，下次查询时重新加载字段
 	}
 
 	return nil
+}
+
+// tableHasPrimaryKey 检查线上表当前是否已存在主键约束。
+// 用 TABLE_CONSTRAINTS 判定，不看具体列——本包只补"从无到有"的主键，
+// 不做主键列的比对/改写（那需要 DROP+ADD，属破坏性操作）。
+func (p *DB) tableHasPrimaryKey(tableName string) (bool, error) {
+	query := `
+		SELECT COUNT(*)
+		FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_TYPE = 'PRIMARY KEY'
+	`
+	var count int
+	if err := p.DB.QueryRowContext(p.context(), query, p.DBName, tableName).Scan(&count); err != nil {
+		return false, fmt.Errorf("query primary key constraint for table %s: %w", tableName, err)
+	}
+	return count > 0, nil
 }
 
 // IsTableExists 检查表是否存在
@@ -712,7 +766,7 @@ func (m *MessageTable) GetInsertSQLWithArgs(message proto.Message) (*SqlWithArgs
 	var args []interface{}
 	for i := 0; i < m.Descriptor.Fields().Len(); i++ {
 		fieldDesc := m.Descriptor.Fields().Get(i)
-		val, err := pbconv.SerializeFieldAsString(message, fieldDesc)
+		val, err := pbconv.SerializeFieldValue(message, fieldDesc)
 		if err != nil {
 			return nil, fmt.Errorf("serialize field %s: %w", fieldDesc.Name(), err)
 		}
@@ -744,7 +798,7 @@ func (m *MessageTable) GetBatchInsertSQLWithArgs(messages []proto.Message) (*Sql
 		args := make([]interface{}, 0, fieldCount)
 		for i := 0; i < fieldCount; i++ {
 			fieldDesc := m.Descriptor.Fields().Get(i)
-			val, err := pbconv.SerializeFieldAsString(msg, fieldDesc)
+			val, err := pbconv.SerializeFieldValue(msg, fieldDesc)
 			if err != nil {
 				return nil, fmt.Errorf("serialize field %s: %w", fieldDesc.Name(), err)
 			}
@@ -789,7 +843,7 @@ func (m *MessageTable) GetInsertOnDupUpdateSQLWithArgs(message proto.Message) (*
 		if !reflection.Has(fieldDesc) {
 			continue
 		}
-		val, err := pbconv.SerializeFieldAsString(message, fieldDesc)
+		val, err := pbconv.SerializeFieldValue(message, fieldDesc)
 		if err != nil {
 			return nil, fmt.Errorf("serialize update field %s: %w", fieldDesc.Name(), err)
 		}
@@ -820,7 +874,7 @@ func (m *MessageTable) GetInsertOnDupKeyForPrimaryKeyWithArgs(message proto.Mess
 	}
 
 	primaryKeyName := string(m.primaryKeyField.Name())
-	primaryKeyValue, err := pbconv.SerializeFieldAsString(message, m.primaryKeyField)
+	primaryKeyValue, err := pbconv.SerializeFieldValue(message, m.primaryKeyField)
 	if err != nil {
 		return nil, fmt.Errorf("serialize primary key: %w", err)
 	}
@@ -1139,7 +1193,7 @@ func (p *DB) UpdateFieldsByPK(message proto.Message, fields ...string) error {
 		if !ok {
 			return fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, field, table.tableName)
 		}
-		val, err := pbconv.SerializeFieldAsString(message, desc)
+		val, err := pbconv.SerializeFieldValue(message, desc)
 		if err != nil {
 			return fmt.Errorf("serialize update field %s: %w", field, err)
 		}
@@ -1198,7 +1252,7 @@ func (p *DB) UpdateIfVersion(message proto.Message, versionField string) (bool, 
 		return false, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, versionField, table.tableName)
 	}
 
-	curVersion, err := pbconv.SerializeFieldAsString(message, versionDesc)
+	curVersion, err := pbconv.SerializeFieldValue(message, versionDesc)
 	if err != nil {
 		return false, fmt.Errorf("serialize version field %s: %w", versionField, err)
 	}
@@ -1217,7 +1271,7 @@ func (p *DB) UpdateIfVersion(message proto.Message, versionField string) (bool, 
 		if name == versionField || pkSet[name] || !reflection.Has(field) {
 			continue
 		}
-		val, err := pbconv.SerializeFieldAsString(message, field)
+		val, err := pbconv.SerializeFieldValue(message, field)
 		if err != nil {
 			return false, fmt.Errorf("serialize update field %s: %w", name, err)
 		}
@@ -1274,7 +1328,7 @@ func (p *DB) UpdateFieldsIfVersion(message proto.Message, versionField string, f
 	if !ok {
 		return false, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, versionField, table.tableName)
 	}
-	curVersion, err := pbconv.SerializeFieldAsString(message, versionDesc)
+	curVersion, err := pbconv.SerializeFieldValue(message, versionDesc)
 	if err != nil {
 		return false, fmt.Errorf("serialize version field %s: %w", versionField, err)
 	}
@@ -1289,7 +1343,7 @@ func (p *DB) UpdateFieldsIfVersion(message proto.Message, versionField string, f
 		if !ok {
 			return false, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, name, table.tableName)
 		}
-		val, err := pbconv.SerializeFieldAsString(message, desc)
+		val, err := pbconv.SerializeFieldValue(message, desc)
 		if err != nil {
 			return false, fmt.Errorf("serialize update field %s: %w", name, err)
 		}
@@ -1331,7 +1385,7 @@ func (m *MessageTable) GetReplaceSQLWithArgs(message proto.Message) (*SqlWithArg
 	var args []interface{}
 	for i := 0; i < m.Descriptor.Fields().Len(); i++ {
 		fieldDesc := m.Descriptor.Fields().Get(i)
-		val, err := pbconv.SerializeFieldAsString(message, fieldDesc)
+		val, err := pbconv.SerializeFieldValue(message, fieldDesc)
 		if err != nil {
 			return nil, fmt.Errorf("serialize field %s: %w", fieldDesc.Name(), err)
 		}
@@ -1360,7 +1414,7 @@ func (m *MessageTable) GetUpdateSetWithArgs(message proto.Message) (string, []in
 			continue
 		}
 
-		val, err := pbconv.SerializeFieldAsString(message, field)
+		val, err := pbconv.SerializeFieldValue(message, field)
 		if err != nil {
 			return "", nil, fmt.Errorf("serialize update field %s: %w", field.Name(), err)
 		}

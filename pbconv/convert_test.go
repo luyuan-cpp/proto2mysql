@@ -2,15 +2,20 @@ package pbconv
 
 import (
 	"bytes"
+	"errors"
+	"math"
 	"strings"
 	"testing"
+	"time"
 
 	testpb "github.com/luyuancpp/proto2mysql/internal/testpb"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // TestBinaryFieldsAreRawNotBase64 钉住二进制字段的存储编码：
@@ -254,5 +259,208 @@ func TestBoolIsNumericLiteral(t *testing.T) {
 		if err := ParseFromString(dst.Interface(), []string{raw}); err != nil {
 			t.Errorf("读回 %q 失败: %v", raw, err)
 		}
+	}
+}
+
+// probeMsg 现造一个 message 描述符：id(int32) + 一个被测字段
+func probeMsg(t *testing.T, name string, f *descriptorpb.FieldDescriptorProto, deps ...string) protoreflect.MessageDescriptor {
+	t.Helper()
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String(name + ".proto"),
+		Package:    proto.String("pbconvprobe"),
+		Syntax:     proto.String("proto3"),
+		Dependency: deps,
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name:  proto.String(name),
+			Field: []*descriptorpb.FieldDescriptorProto{f},
+		}},
+	}
+	fd, err := protodesc.NewFile(fdp, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatalf("build descriptor %s: %v", name, err)
+	}
+	return fd.Messages().Get(0)
+}
+
+func tsField() *descriptorpb.FieldDescriptorProto {
+	return &descriptorpb.FieldDescriptorProto{
+		Name: proto.String("ts"), Number: proto.Int32(1),
+		Type:     descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(),
+		Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		TypeName: proto.String(".google.protobuf.Timestamp"),
+	}
+}
+
+// TestTimestampKeepsSubSecond Timestamp 的亚秒精度不得被静默丢掉。
+// 旧实现用 "2006-01-02 15:04:05" 写入，毫秒/纳秒无声消失且不报错，是最难发现的一类数据损坏。
+func TestTimestampKeepsSubSecond(t *testing.T) {
+	md := probeMsg(t, "ts_precision", tsField(), "google/protobuf/timestamp.proto")
+	field := md.Fields().ByName("ts")
+
+	base := time.Date(2026, 7, 29, 12, 34, 56, 123456789, time.UTC)
+	m := dynamicpb.NewMessage(md)
+	m.Set(field, protoreflect.ValueOfMessage(timestamppb.New(base).ProtoReflect()))
+
+	got, err := SerializeFieldAsString(m.Interface(), field)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	if got != "2026-07-29 12:34:56.123456" {
+		t.Fatalf("应保留到微秒, 实际 %q", got)
+	}
+
+	// 读回：微秒必须还在（纳秒位是 MySQL 时间类型的硬上限，允许丢）
+	dst := dynamicpb.NewMessage(md)
+	if err := ParseFromString(dst.Interface(), []string{got}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	back := dst.Get(field).Message().Interface().(*timestamppb.Timestamp).AsTime().UTC()
+	if want := base.Truncate(time.Microsecond); !back.Equal(want) {
+		t.Errorf("往返丢精度\n实际: %s\n期望: %s", back.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+
+	// 整秒值也要能正常往返
+	whole := time.Date(2026, 7, 29, 12, 34, 56, 0, time.UTC)
+	m2 := dynamicpb.NewMessage(md)
+	m2.Set(field, protoreflect.ValueOfMessage(timestamppb.New(whole).ProtoReflect()))
+	s2, _ := SerializeFieldAsString(m2.Interface(), field)
+	dst2 := dynamicpb.NewMessage(md)
+	if err := ParseFromString(dst2.Interface(), []string{s2}); err != nil {
+		t.Fatalf("parse whole second: %v", err)
+	}
+	if b2 := dst2.Get(field).Message().Interface().(*timestamppb.Timestamp).AsTime().UTC(); !b2.Equal(whole) {
+		t.Errorf("整秒往返不一致: %s", b2)
+	}
+}
+
+// TestUnsetTimestampIsSQLNull 未设置的 Timestamp 必须下发 SQL NULL。
+// 空串在 STRICT_TRANS_TABLES 下会被 MySQL 拒（Error 1292），导致整行插不进去。
+func TestUnsetTimestampIsSQLNull(t *testing.T) {
+	md := probeMsg(t, "ts_null", tsField(), "google/protobuf/timestamp.proto")
+	field := md.Fields().ByName("ts")
+
+	unset := dynamicpb.NewMessage(md)
+	val, err := SerializeFieldValue(unset.Interface(), field)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	if val != nil {
+		t.Errorf("未设置的 Timestamp 应下发 nil(SQL NULL), 实际 %#v", val)
+	}
+
+	// 已设置时仍是字符串
+	set := dynamicpb.NewMessage(md)
+	set.Set(field, protoreflect.ValueOfMessage(timestamppb.New(time.Date(2026, 7, 29, 1, 2, 3, 0, time.UTC)).ProtoReflect()))
+	val2, err := SerializeFieldValue(set.Interface(), field)
+	if err != nil {
+		t.Fatalf("serialize set: %v", err)
+	}
+	if s, ok := val2.(string); !ok || s == "" {
+		t.Errorf("已设置的 Timestamp 应下发非空字符串, 实际 %#v", val2)
+	}
+}
+
+// TestUnsetNonTimestampStaysEmptyString 只有 Timestamp 走 NULL；
+// 其余字段（未设置的嵌套消息、空容器）的列是 NOT NULL 的 BLOB，必须保持空串
+func TestUnsetNonTimestampStaysEmptyString(t *testing.T) {
+	src := &testpb.GolangTest{Id: 1} // player 子消息未设置
+	fd := src.ProtoReflect().Descriptor().Fields().ByName("player")
+	val, err := SerializeFieldValue(src, fd)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	if val != "" {
+		t.Errorf("未设置的嵌套消息应为空串而非 NULL, 实际 %#v", val)
+	}
+}
+
+// TestNonFiniteFloatRejected NaN/±Inf 必须在序列化阶段就报清楚的错。
+// MySQL 的 FLOAT/DOUBLE 无法表示它们：STRICT 模式下报 Error 1265（看不出根因），
+// 非 STRICT 模式下会被悄悄存成 0，那是静默的数据损坏。
+func TestNonFiniteFloatRejected(t *testing.T) {
+	for _, k := range []struct {
+		name string
+		typ  descriptorpb.FieldDescriptorProto_Type
+	}{
+		{"double", descriptorpb.FieldDescriptorProto_TYPE_DOUBLE},
+		{"float", descriptorpb.FieldDescriptorProto_TYPE_FLOAT},
+	} {
+		md := probeMsg(t, "f_"+k.name, &descriptorpb.FieldDescriptorProto{
+			Name: proto.String("v"), Number: proto.Int32(1),
+			Type: k.typ.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		})
+		field := md.Fields().ByName("v")
+
+		for _, bad := range []struct {
+			label string
+			val   float64
+		}{{"NaN", math.NaN()}, {"+Inf", math.Inf(1)}, {"-Inf", math.Inf(-1)}} {
+			m := dynamicpb.NewMessage(md)
+			if k.typ == descriptorpb.FieldDescriptorProto_TYPE_FLOAT {
+				m.Set(field, protoreflect.ValueOfFloat32(float32(bad.val)))
+			} else {
+				m.Set(field, protoreflect.ValueOfFloat64(bad.val))
+			}
+			if _, err := SerializeFieldValue(m.Interface(), field); !errors.Is(err, ErrNonFiniteFloat) {
+				t.Errorf("%s %s 应返回 ErrNonFiniteFloat, 实际: %v", k.name, bad.label, err)
+			}
+		}
+
+		// 有限值不受影响
+		m := dynamicpb.NewMessage(md)
+		if k.typ == descriptorpb.FieldDescriptorProto_TYPE_FLOAT {
+			m.Set(field, protoreflect.ValueOfFloat32(3.5))
+		} else {
+			m.Set(field, protoreflect.ValueOfFloat64(-1.25e300))
+		}
+		if _, err := SerializeFieldValue(m.Interface(), field); err != nil {
+			t.Errorf("%s 有限值不应报错: %v", k.name, err)
+		}
+	}
+}
+
+// TestTimestampParsesDriverParseTimeForm 连接串开 parseTime=true 时（NewMysqlConfig 的默认值），
+// 驱动把 DATETIME 解成 time.Time，再扫进 []byte 会得到 RFC3339 文本而非 MySQL 原生文本。
+// 少了这条兼容，所有开了 parseTime 的连接读 Timestamp 列都会解析失败。
+func TestTimestampParsesDriverParseTimeForm(t *testing.T) {
+	md := probeMsg(t, "ts_driverform", tsField(), "google/protobuf/timestamp.proto")
+	field := md.Fields().ByName("ts")
+
+	want := time.Date(2026, 7, 29, 12, 34, 56, 123456000, time.UTC)
+	for _, raw := range []string{
+		"2026-07-29 12:34:56.123456",  // MySQL 原生文本
+		"2026-07-29T12:34:56.123456Z", // parseTime=true 时驱动给的形态
+	} {
+		dst := dynamicpb.NewMessage(md)
+		if err := ParseFromString(dst.Interface(), []string{raw}); err != nil {
+			t.Fatalf("解析 %q 失败: %v", raw, err)
+		}
+		got := dst.Get(field).Message().Interface().(*timestamppb.Timestamp).AsTime().UTC()
+		if !got.Equal(want) {
+			t.Errorf("解析 %q 得到 %s, 期望 %s", raw, got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+		}
+	}
+
+	// 整秒的两种形态也要都能解
+	for _, raw := range []string{"2026-07-29 12:34:56", "2026-07-29T12:34:56Z"} {
+		dst := dynamicpb.NewMessage(md)
+		if err := ParseFromString(dst.Interface(), []string{raw}); err != nil {
+			t.Errorf("解析 %q 失败: %v", raw, err)
+		}
+	}
+}
+
+// TestTimestampNullClearsExistingValue 查询结果为SQL NULL时，复用的消息不得保留上一次的值。
+func TestTimestampNullClearsExistingValue(t *testing.T) {
+	md := probeMsg(t, "ts_null_read", tsField(), "google/protobuf/timestamp.proto")
+	field := md.Fields().ByName("ts")
+	dst := dynamicpb.NewMessage(md)
+	dst.Set(field, protoreflect.ValueOfMessage(timestamppb.Now().ProtoReflect()))
+
+	if err := ParseFromString(dst.Interface(), []string{""}); err != nil {
+		t.Fatalf("解析NULL Timestamp失败: %v", err)
+	}
+	if dst.Has(field) {
+		t.Fatal("SQL NULL 应清除复用消息中已有的 Timestamp")
 	}
 }

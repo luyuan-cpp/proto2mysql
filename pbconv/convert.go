@@ -3,6 +3,7 @@ package pbconv
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -11,10 +12,35 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// SerializeFieldAsString 将消息中的单个字段序列化为可直接下发给MySQL的值：
-//   - Timestamp        -> "2006-01-02 15:04:05"
+// SerializeFieldValue 把字段序列化为可直接下发给MySQL的参数值。
+// 与SerializeFieldAsString的唯一区别：**未设置的Timestamp返回nil（SQL NULL）而不是空串**。
+//
+// 为什么必须区分：DATETIME列没有"零值"可写——在NO_ZERO_DATE下'0000-00-00'非法，空串
+// 在STRICT_TRANS_TABLES下直接被拒（Error 1292 Incorrect datetime value: ”）。
+// 也就是说，只要消息里有一个Timestamp字段没赋值，整行就插不进去。唯一正确的表示是NULL，
+// 而string表达不了NULL，所以生成SQL参数一律走本函数，不要用SerializeFieldAsString。
+//
+// 其余字段（含未设置的嵌套消息/空容器）仍返回空串：它们的列是BLOB系且NOT NULL，
+// 空串能正确往返，不需要NULL。
+func SerializeFieldValue(message proto.Message, fieldDesc protoreflect.FieldDescriptor) (interface{}, error) {
+	val, err := SerializeFieldAsString(message, fieldDesc)
+	if err != nil {
+		return nil, err
+	}
+	// Timestamp的空串代表"未设置"，必须落成SQL NULL
+	if val == "" && isTimestampField(fieldDesc) {
+		return nil, nil
+	}
+	return val, nil
+}
+
+// SerializeFieldAsString 将消息中的单个字段序列化为字符串形式：
+//   - Timestamp        -> "2006-01-02 15:04:05.000000"（未设置时为空串，见SerializeFieldValue）
 //   - map/list/bytes/嵌套消息 -> proto wire格式**裸字节**（装在string里，非UTF-8文本）
 //   - 标量             -> 十进制/布尔字符串
+//
+// ⚠️ 生成SQL参数请用SerializeFieldValue：本函数无法表达SQL NULL，
+// 未设置的Timestamp会得到空串，直接下发会被MySQL拒绝。
 //
 // 二进制字段不做Base64：目标列是MEDIUMBLOB，本身二进制安全，编码只会白白多占33%体积
 // 并在每次读写上加一次编解码。Go的string可承载任意字节，驱动以参数下发时逐字节无损，
@@ -39,9 +65,9 @@ func SerializeFieldAsString(message proto.Message, fieldDesc protoreflect.FieldD
 	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
 		return strconv.FormatUint(reflection.Get(fieldDesc).Uint(), 10), nil
 	case protoreflect.FloatKind:
-		return strconv.FormatFloat(reflection.Get(fieldDesc).Float(), 'f', -1, 32), nil
+		return formatFloat(reflection.Get(fieldDesc).Float(), 32, fieldDesc)
 	case protoreflect.DoubleKind:
-		return strconv.FormatFloat(reflection.Get(fieldDesc).Float(), 'f', -1, 64), nil
+		return formatFloat(reflection.Get(fieldDesc).Float(), 64, fieldDesc)
 	case protoreflect.StringKind:
 		return reflection.Get(fieldDesc).String(), nil
 	case protoreflect.BoolKind:
@@ -68,6 +94,17 @@ func SerializeFieldAsString(message proto.Message, fieldDesc protoreflect.FieldD
 	default:
 		return "", fmt.Errorf("%w: %v (field: %s)", ErrInvalidFieldKind, fieldDesc.Kind(), fieldDesc.Name())
 	}
+}
+
+// formatFloat 格式化浮点数，NaN/±Inf 直接报错而不是交给MySQL。
+// MySQL的FLOAT/DOUBLE没有NaN/Inf的表示：下发"NaN"/"+Inf"在STRICT模式下报
+// Error 1265 Data truncated（错误信息完全看不出根因），非STRICT模式下会被悄悄存成0——
+// 那是静默的数据损坏。这里fail-closed，把问题挡在写库之前。
+func formatFloat(f float64, bitSize int, fieldDesc protoreflect.FieldDescriptor) (string, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return "", fmt.Errorf("%w: field %s = %v", ErrNonFiniteFloat, fieldDesc.Name(), f)
+	}
+	return strconv.FormatFloat(f, 'f', -1, bitSize), nil
 }
 
 // serializeTimestamp 将Timestamp字段格式化为MySQL DATETIME字符串（未设置或零值返回空串）
@@ -105,16 +142,33 @@ var (
 	timestampFullName = (&timestamppb.Timestamp{}).ProtoReflect().Descriptor().FullName()
 
 	ErrInvalidFieldKind = errors.New("invalid field kind")
+	// ErrNonFiniteFloat 浮点字段为NaN或±Inf；MySQL的FLOAT/DOUBLE无法表示，拒绝写入
+	ErrNonFiniteFloat = errors.New("non-finite float value (NaN/Inf) cannot be stored in MySQL")
 )
 
-// mysqlDateTimeLayout 是写入MySQL DATETIME列的时间格式
-const mysqlDateTimeLayout = "2006-01-02 15:04:05"
+// mysqlDateTimeLayout 是写入MySQL DATETIME列的时间格式。
+// 必须带6位小数秒：不带的话毫秒/纳秒会被**静默**截断到整秒（不报错、无警告），
+// 对应列类型为DATETIME(6)（见MySQLFieldTypes）。
+// MySQL时间类型最高只支持微秒(fsp=6)，所以proto Timestamp的纳秒位仍会丢——这是MySQL的硬上限。
+//
+// ⚠️ 写进未迁移的老DATETIME(0)列时，MySQL会按小数秒**四舍五入**（.9 会进位到下一秒），
+// 而不是像旧版本那样在Go侧截断。存量表请先 ALTER ... MODIFY col DATETIME(6)。
+const mysqlDateTimeLayout = "2006-01-02 15:04:05.000000"
 
-// timestampParseLayouts 是从MySQL读取时间时支持的格式（按优先级尝试）
+// timestampParseLayouts 是从MySQL读取时间时支持的格式（按优先级尝试）。
+// 注意Go的解析规则：即使layout里没写小数秒，输入带小数秒也会被正确吸收，
+// 所以首个layout足以覆盖到微秒精度，无需为DATETIME(6)单独加一条。
+//
+// 为什么要带RFC3339：连接串开了parseTime=true时（NewMysqlConfig的默认值，README示例的DSN
+// 也是这么写的），驱动会把DATETIME解码成time.Time；再扫描进[]byte时，database/sql按
+// RFC3339Nano渲染，拿到的是"2026-07-29T12:34:56.123456Z"而不是MySQL的原生文本。
+// 少了这两条，凡是开了parseTime的连接读Timestamp列一律解析失败。
 var timestampParseLayouts = []string{
-	"2006-01-02 15:04:05.999", // 带毫秒
-	"2006-01-02 15:04:05",     // 不带毫秒
-	"2006-01-02",              // 仅日期
+	"2006-01-02 15:04:05.999999", // MySQL原生文本（带小数秒，微秒及以下任意位数）
+	"2006-01-02 15:04:05",        // MySQL原生文本（不带小数秒）
+	time.RFC3339Nano,             // parseTime=true 时驱动转换后的形态
+	time.RFC3339,
+	"2006-01-02", // 仅日期（DATE列）
 }
 
 // isTimestampField 判断字段是否为单值的google.protobuf.Timestamp
@@ -224,9 +278,12 @@ func setFieldFromString(reflection protoreflect.Message, fieldDesc protoreflect.
 	return nil
 }
 
-// parseTimestamp 解析MySQL时间字符串到Timestamp字段（空值跳过）
+// parseTimestamp 解析MySQL时间字符串到Timestamp字段（空值清除字段）
 func parseTimestamp(reflection protoreflect.Message, fieldDesc protoreflect.FieldDescriptor, raw string) error {
 	if raw == "" {
+		// SQL NULL 扫描到 []byte 后表现为空值。调用方可能复用已有 message，
+		// 因此必须显式清除字段，不能让上一次查询的 Timestamp 残留。
+		reflection.Clear(fieldDesc)
 		return nil
 	}
 	var parsed time.Time

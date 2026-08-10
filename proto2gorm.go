@@ -267,7 +267,7 @@ func (p *GormDB) UpdateFieldsByPK(message proto.Message, fields ...string) error
 		if !ok {
 			return fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, field, table.tableName)
 		}
-		val, err := pbconv.SerializeFieldAsString(message, desc)
+		val, err := pbconv.SerializeFieldValue(message, desc)
 		if err != nil {
 			return fmt.Errorf("serialize update field %s: %w", field, err)
 		}
@@ -310,7 +310,7 @@ func (p *GormDB) UpdateIfVersion(message proto.Message, versionField string) (bo
 		return false, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, versionField, table.tableName)
 	}
 
-	curVersion, err := pbconv.SerializeFieldAsString(message, versionDesc)
+	curVersion, err := pbconv.SerializeFieldValue(message, versionDesc)
 	if err != nil {
 		return false, fmt.Errorf("serialize version field %s: %w", versionField, err)
 	}
@@ -359,7 +359,7 @@ func (p *GormDB) UpdateFieldsIfVersion(message proto.Message, versionField strin
 	if !ok {
 		return false, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, versionField, table.tableName)
 	}
-	curVersion, err := pbconv.SerializeFieldAsString(message, versionDesc)
+	curVersion, err := pbconv.SerializeFieldValue(message, versionDesc)
 	if err != nil {
 		return false, fmt.Errorf("serialize version field %s: %w", versionField, err)
 	}
@@ -373,7 +373,7 @@ func (p *GormDB) UpdateFieldsIfVersion(message proto.Message, versionField strin
 		if !ok {
 			return false, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, name, table.tableName)
 		}
-		val, err := pbconv.SerializeFieldAsString(message, desc)
+		val, err := pbconv.SerializeFieldValue(message, desc)
 		if err != nil {
 			return false, fmt.Errorf("serialize update field %s: %w", name, err)
 		}
@@ -444,7 +444,7 @@ func (p *GormDB) BatchDelete(messages []proto.Message) error {
 		if msg.ProtoReflect().Descriptor() != table.Descriptor {
 			return fmt.Errorf("messages have different descriptors")
 		}
-		val, err := pbconv.SerializeFieldAsString(msg, table.primaryKeyField)
+		val, err := pbconv.SerializeFieldValue(msg, table.primaryKeyField)
 		if err != nil {
 			return fmt.Errorf("serialize primary key: %w", err)
 		}
@@ -836,7 +836,7 @@ func (m *MessageTable) messageValues(message proto.Message, includeUnset bool, s
 			continue
 		}
 
-		val, err := pbconv.SerializeFieldAsString(message, field)
+		val, err := pbconv.SerializeFieldValue(message, field)
 		if err != nil {
 			return nil, fmt.Errorf("serialize field %s: %w", field.Name(), err)
 		}
@@ -871,7 +871,7 @@ func (m *MessageTable) primaryKeyValues(message proto.Message) ([]interface{}, e
 			return nil, fmt.Errorf("%w: primary key %s in table %s", ErrFieldNotFound, primaryKey, m.tableName)
 		}
 
-		val, err := pbconv.SerializeFieldAsString(message, field)
+		val, err := pbconv.SerializeFieldValue(message, field)
 		if err != nil {
 			return nil, fmt.Errorf("serialize primary key %s: %w", primaryKey, err)
 		}

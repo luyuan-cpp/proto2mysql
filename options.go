@@ -8,6 +8,7 @@ package proto2mysql
 import (
 	"strings"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -18,6 +19,12 @@ const (
 	optNumAutoIncrementKey = 500006 // 自增字段
 	optNumIndex            = 500011 // 普通索引（分号分隔多个索引，每个索引内逗号分隔=联合索引）
 	optNumUniqueKey        = 500012 // 唯一键（逗号分隔=联合唯一键）
+
+	// TiDB 方言（生成 /*T!*/ 扩展注释，MySQL 视为普通注释忽略）
+	optNumTiDBNonclusteredPK  = 500021 // 主键追加 NONCLUSTERED
+	optNumTiDBShardRowIDBits  = 500022 // SHARD_ROW_ID_BITS=N
+	optNumTiDBPreSplitRegions = 500023 // PRE_SPLIT_REGIONS=N（依赖 SHARD_ROW_ID_BITS）
+	optNumTiDBAutoIDCacheOne  = 500024 // AUTO_ID_CACHE=1
 )
 
 // field option 字段号
@@ -81,6 +88,22 @@ func TableOptionsFromDescriptor(md protoreflect.MessageDescriptor) []TableOption
 			if s := strings.TrimSpace(v.String()); s != "" {
 				opts = append(opts, WithUniqueKey(s))
 			}
+		case optNumTiDBNonclusteredPK:
+			if v.Bool() {
+				opts = append(opts, WithTiDBNonclusteredPK())
+			}
+		case optNumTiDBShardRowIDBits:
+			if n := v.Uint(); n > 0 {
+				opts = append(opts, WithTiDBShardRowIDBits(uint32(n)))
+			}
+		case optNumTiDBPreSplitRegions:
+			if n := v.Uint(); n > 0 {
+				opts = append(opts, WithTiDBPreSplitRegions(uint32(n)))
+			}
+		case optNumTiDBAutoIDCacheOne:
+			if v.Bool() {
+				opts = append(opts, WithTiDBAutoIDCacheOne())
+			}
 		}
 	})
 
@@ -104,6 +127,11 @@ func TableOptionsFromDescriptor(md protoreflect.MessageDescriptor) []TableOption
 // rangeExtensions 遍历 options 消息上已设置的扩展字段（按字段号回调）。
 // 按字段号而非扩展类型匹配：动态描述符（protocompile/dynamicpb）与生成代码的扩展类型标识不同，
 // 但字段号一致。
+//
+// 另外补扫 unknown fields：若二进制里链接的选项生成代码（pbopt）旧于运行时使用的选项号
+// （例如本库新增选项后使用方尚未重新生成/升级 pbopt），protobuf 解析 options 时会把
+// 未注册的扩展落进 unknown fields，Range 看不到——不兜底的话这些选项会被静默丢弃。
+// 这里按 wire 格式解出本库定义的选项号，保证选项不因生成代码滞后而失效。
 func rangeExtensions(opts protoreflect.ProtoMessage, fn func(protoreflect.FieldNumber, protoreflect.Value)) {
 	if opts == nil {
 		return
@@ -112,12 +140,81 @@ func rangeExtensions(opts protoreflect.ProtoMessage, fn func(protoreflect.FieldN
 	if !m.IsValid() {
 		return
 	}
+	seen := map[protoreflect.FieldNumber]bool{}
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 		if fd.IsExtension() {
+			seen[fd.Number()] = true
 			fn(fd.Number(), v)
 		}
 		return true
 	})
+	rangeUnknownOptionFields(m.GetUnknown(), seen, fn)
+}
+
+// unknownOptionKinds 本库全部选项号 → 声明类型，unknown fields 兜底解码时用。
+var unknownOptionKinds = map[protoreflect.FieldNumber]protoreflect.Kind{
+	optNumFileDB:              protoreflect.BoolKind,
+	optNumTableName:           protoreflect.StringKind,
+	optNumPrimaryKey:          protoreflect.StringKind,
+	optNumAutoIncrementKey:    protoreflect.StringKind,
+	optNumIndex:               protoreflect.StringKind,
+	optNumUniqueKey:           protoreflect.StringKind,
+	optNumFieldNullable:       protoreflect.BoolKind,
+	optNumTiDBNonclusteredPK:  protoreflect.BoolKind,
+	optNumTiDBShardRowIDBits:  protoreflect.Uint32Kind,
+	optNumTiDBPreSplitRegions: protoreflect.Uint32Kind,
+	optNumTiDBAutoIDCacheOne:  protoreflect.BoolKind,
+}
+
+// rangeUnknownOptionFields 从 options 的 unknown fields 中解出本库定义的选项并回调。
+// 只认识 unknownOptionKinds 里的字段号；已经在已知扩展里出现过的字段号（seen）跳过。
+// wire 类型与选项声明类型不匹配的字段跳过不回调（正常消费掉字节，保证解析不中断）。
+func rangeUnknownOptionFields(b protoreflect.RawFields, seen map[protoreflect.FieldNumber]bool, fn func(protoreflect.FieldNumber, protoreflect.Value)) {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return
+		}
+		b = b[n:]
+
+		kind, known := unknownOptionKinds[num]
+		if !known || seen[num] {
+			if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
+				return
+			}
+			b = b[n:]
+			continue
+		}
+
+		switch typ {
+		case protowire.VarintType:
+			v, m := protowire.ConsumeVarint(b)
+			if m < 0 {
+				return
+			}
+			b = b[m:]
+			switch kind {
+			case protoreflect.BoolKind:
+				fn(num, protoreflect.ValueOfBool(v != 0))
+			case protoreflect.Uint32Kind:
+				fn(num, protoreflect.ValueOfUint32(uint32(v)))
+			}
+		case protowire.BytesType:
+			v, m := protowire.ConsumeBytes(b)
+			if m < 0 {
+				return
+			}
+			b = b[m:]
+			if kind == protoreflect.StringKind {
+				fn(num, protoreflect.ValueOfString(string(v)))
+			}
+		default:
+			if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
+				return
+			}
+			b = b[n:]
+		}
+	}
 }
 
 // splitOptionCSV 拆分逗号分隔的字段列表并去空白，忽略空项。

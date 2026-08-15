@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	testpb "github.com/luyuancpp/proto2mysql/internal/testpb"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -2842,5 +2843,129 @@ func TestTimestampEndToEnd(t *testing.T) {
 	got := back.Get(tsField).Message().Interface().(*timestamppb.Timestamp).AsTime().UTC()
 	if want := base.Truncate(time.Microsecond); !got.Equal(want) {
 		t.Errorf("往返丢精度\n实际: %s\n期望: %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+}
+
+// TestTiDBDialectDDL 单元测试：TiDB 方言表选项以 /*T!*/ 扩展注释进入 DDL。
+// TiDB 解析注释内容，MySQL 视为普通注释忽略——同一份建表语句双方言可用。
+func TestTiDBDialectDDL(t *testing.T) {
+	// 完整组合：非聚簇主键 + shard + 预切分（snowflake 主键防写热点的标准建表形态）
+	table := newMessageTable(&testpb.Player{},
+		WithTableName("tidb_probe"),
+		WithPrimaryKey("player_id"),
+		WithTiDBNonclusteredPK(),
+		WithTiDBShardRowIDBits(4),
+		WithTiDBPreSplitRegions(4),
+	)
+	ddl := table.GetCreateTableSQL()
+	if !strings.Contains(ddl, "PRIMARY KEY (`player_id`) /*T![clustered_index] NONCLUSTERED */") {
+		t.Errorf("主键应带 NONCLUSTERED 注释:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, " /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='tidb_probe';") {
+		t.Errorf("SHARD_ROW_ID_BITS + PRE_SPLIT_REGIONS 注释块应位于 COMMENT 之前（TiDB 规范导出顺序）:\n%s", ddl)
+	}
+
+	// 默认（不开任何 TiDB 选项）不得出现 /*T! —— 保证纯 MySQL 用户的 DDL 完全不变
+	plain := newMessageTable(&testpb.Player{},
+		WithTableName("plain_probe"), WithPrimaryKey("player_id"))
+	if plainDDL := plain.GetCreateTableSQL(); strings.Contains(plainDDL, "/*T!") {
+		t.Errorf("未开启 TiDB 选项时 DDL 不得含 /*T! 注释:\n%s", plainDDL)
+	}
+
+	// PRE_SPLIT_REGIONS 依赖 SHARD_ROW_ID_BITS：单独设置应被忽略，而不是生成必然报错的 DDL
+	noShard := newMessageTable(&testpb.Player{},
+		WithTableName("noshard_probe"), WithPrimaryKey("player_id"),
+		WithTiDBPreSplitRegions(4))
+	if noShardDDL := noShard.GetCreateTableSQL(); strings.Contains(noShardDDL, "PRE_SPLIT_REGIONS") {
+		t.Errorf("无 SHARD_ROW_ID_BITS 时 PRE_SPLIT_REGIONS 应被忽略:\n%s", noShardDDL)
+	}
+
+	// AUTO_ID_CACHE=1 独立生效，且带 feature id 注释、位于 COMMENT 之前
+	cacheOne := newMessageTable(&testpb.Player{},
+		WithTableName("cache_probe"), WithPrimaryKey("player_id"),
+		WithTiDBAutoIDCacheOne())
+	if cacheDDL := cacheOne.GetCreateTableSQL(); !strings.Contains(cacheDDL, " /*T![auto_id_cache] AUTO_ID_CACHE=1 */ COMMENT='cache_probe';") {
+		t.Errorf("应生成 AUTO_ID_CACHE=1 注释:\n%s", cacheDDL)
+	}
+
+	// fail-safe：有主键但未声明 NONCLUSTERED 时，shard（连带 preSplit）应被忽略——
+	// TiDB 聚簇表不支持 SHARD_ROW_ID_BITS，生成了也必然建表失败
+	clustered := newMessageTable(&testpb.Player{},
+		WithTableName("clustered_probe"), WithPrimaryKey("player_id"),
+		WithTiDBShardRowIDBits(4), WithTiDBPreSplitRegions(4))
+	if clusteredDDL := clustered.GetCreateTableSQL(); strings.Contains(clusteredDDL, "SHARD_ROW_ID_BITS") {
+		t.Errorf("主键未声明 NONCLUSTERED 时 SHARD_ROW_ID_BITS 应被忽略:\n%s", clusteredDDL)
+	}
+
+	// fail-safe：PRE_SPLIT_REGIONS 超过 SHARD_ROW_ID_BITS 时收敛到 shard 值（TiDB 硬约束）
+	clamp := newMessageTable(&testpb.Player{},
+		WithTableName("clamp_probe"), WithPrimaryKey("player_id"),
+		WithTiDBNonclusteredPK(), WithTiDBShardRowIDBits(4), WithTiDBPreSplitRegions(6))
+	if clampDDL := clamp.GetCreateTableSQL(); !strings.Contains(clampDDL, "SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4") {
+		t.Errorf("PRE_SPLIT_REGIONS 应收敛到 SHARD_ROW_ID_BITS 值:\n%s", clampDDL)
+	}
+
+	// GenerateCreateTableSQL（免注册路径）应同样透传 TiDB 选项
+	genDDL := GenerateCreateTableSQL(&testpb.Player{},
+		WithTableName("gen_probe"), WithPrimaryKey("player_id"),
+		WithTiDBNonclusteredPK(), WithTiDBShardRowIDBits(2))
+	if !strings.Contains(genDDL, "NONCLUSTERED") || !strings.Contains(genDDL, "SHARD_ROW_ID_BITS=2") {
+		t.Errorf("GenerateCreateTableSQL 应透传 TiDB 选项:\n%s", genDDL)
+	}
+}
+
+// TestTiDBOptionsFromUnknownFields 回归：pbopt 生成代码旧于运行时选项号时，
+// protobuf 会把未注册的扩展落进 options 的 unknown fields。选项读取必须兜底解出它们，
+// 不得静默丢弃（否则用户在 .proto 里声明了 TiDB 选项、DDL 却不含 /*T!*/ 子句且无任何报错）。
+func TestTiDBOptionsFromUnknownFields(t *testing.T) {
+	// 手工按 wire 格式构造 unknown fields：模拟"扩展未注册"时 options 的真实形态
+	var raw []byte
+	raw = protowire.AppendTag(raw, optNumTableName, protowire.BytesType)
+	raw = protowire.AppendBytes(raw, []byte("uf_probe"))
+	raw = protowire.AppendTag(raw, optNumPrimaryKey, protowire.BytesType)
+	raw = protowire.AppendBytes(raw, []byte("player_id"))
+	raw = protowire.AppendTag(raw, optNumTiDBNonclusteredPK, protowire.VarintType)
+	raw = protowire.AppendVarint(raw, 1)
+	raw = protowire.AppendTag(raw, optNumTiDBShardRowIDBits, protowire.VarintType)
+	raw = protowire.AppendVarint(raw, 4)
+
+	msgOpts := &descriptorpb.MessageOptions{}
+	msgOpts.ProtoReflect().SetUnknown(protoreflect.RawFields(raw))
+
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("uf_probe.proto"),
+		Package: proto.String("ufprobe"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name:    proto.String("uf_probe"),
+			Options: msgOpts,
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name: proto.String("player_id"), Number: proto.Int32(1),
+				Type:  descriptorpb.FieldDescriptorProto_TYPE_UINT64.Enum(),
+				Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+			}},
+		}},
+	}
+	fd, err := protodesc.NewFile(fdp, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatalf("构造文件描述符失败: %v", err)
+	}
+	md := fd.Messages().Get(0)
+
+	table := &MessageTable{tableName: string(md.FullName()), Descriptor: md}
+	for _, opt := range TableOptionsFromDescriptor(md) {
+		opt(table)
+	}
+	table.Init()
+
+	ddl := table.GetCreateTableSQL()
+	if !strings.Contains(ddl, "`uf_probe`") {
+		t.Errorf("unknown fields 里的 table_name 选项未生效:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "PRIMARY KEY (`player_id`) /*T![clustered_index] NONCLUSTERED */") {
+		t.Errorf("unknown fields 里的 primary_key/tidb_nonclustered_pk 选项未生效:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "SHARD_ROW_ID_BITS=4") {
+		t.Errorf("unknown fields 里的 tidb_shard_row_id_bits 选项未生效:\n%s", ddl)
 	}
 }

@@ -75,3 +75,29 @@ func TestGenerateRequireDBOption(t *testing.T) {
 		t.Fatalf("expected only db-marked account table, got %+v", tables)
 	}
 }
+
+// TestGenerateTiDBDialect 端到端：proto 里声明的 TiDB 方言选项应进入生成的 DDL
+// （/*T!*/ 扩展注释，MySQL 视为注释忽略，TiDB 解析生效）。
+func TestGenerateTiDBDialect(t *testing.T) {
+	tables, err := Generate(context.Background(), Config{
+		ProtoFiles:  []string{"testdata/tidb_hotspot.proto"},
+		ImportPaths: []string{optionProtoDir()},
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(tables) != 1 || tables[0].Name != "tidb_hotspot" {
+		t.Fatalf("expected 1 tidb_hotspot table, got %+v", tables)
+	}
+
+	sql := tables[0].SQL
+	checks := []string{
+		"PRIMARY KEY (`player_id`) /*T![clustered_index] NONCLUSTERED */",
+		"/*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */",
+	}
+	for _, c := range checks {
+		if !strings.Contains(sql, c) {
+			t.Errorf("SQL missing %q\n--- got ---\n%s", c, sql)
+		}
+	}
+}

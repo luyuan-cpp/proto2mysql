@@ -411,6 +411,40 @@ SELECT TO_BASE64(`player`) FROM `golang_test` WHERE `id` = 1;
 - `WithUniqueKey(uniqueKey string)`: 设置唯一键
 - `WithAutoIncrementKey(key string)`: 设置自增字段
 - `WithNullableFields(fields ...string)`: 设置允许为 NULL 的字段
+- `WithTiDBNonclusteredPK()` / `WithTiDBShardRowIDBits(bits)` / `WithTiDBPreSplitRegions(n)` / `WithTiDBAutoIDCacheOne()`: TiDB 方言，见下节
+
+## TiDB 支持
+
+本库生成的 DML（`INSERT` / `INSERT ... ON DUPLICATE KEY UPDATE` / `REPLACE INTO` / `SELECT ... FOR UPDATE`）与多子句 `ALTER TABLE`（TiDB v6.2+）在 TiDB 上直接可用，无需改动。需要额外处理的是**建表**：
+
+**写热点**。业务自赋值的单调递增主键（如 Snowflake，时间戳在高位）在 TiDB 默认聚簇表下会把写入集中到单个 region（官方点名的热点场景），且 `SHARD_ROW_ID_BITS` 对聚簇表无效。标准解法是非聚簇主键 + 打散 + 预切分：
+
+```proto
+message player_data {
+  option (proto2mysql.table_name)             = "player_data";
+  option (proto2mysql.primary_key)            = "player_id";
+  option (proto2mysql.tidb_nonclustered_pk)   = true; // 主键 NONCLUSTERED（代价：点查多一次回表）
+  option (proto2mysql.tidb_shard_row_id_bits) = 4;    // 按 _tidb_rowid 打散，建议 log2(TiKV 节点数)
+  option (proto2mysql.tidb_pre_split_regions) = 4;    // 建表即预切 region，须 ≤ shard_row_id_bits
+
+  uint64 player_id = 1;
+  bytes  data      = 2;
+}
+```
+
+生成的 DDL 用 TiDB 扩展注释语法（`/*T!...*/`），**MySQL 视为普通注释忽略**，同一份建表语句在 MySQL 与 TiDB 上都能执行：
+
+```sql
+CREATE TABLE IF NOT EXISTS `player_data` (
+  `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `data` MEDIUMBLOB COMMENT 'pb:2',
+  PRIMARY KEY (`player_id`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='player_data';
+```
+
+自增表如依赖 ID 近似连续（TiDB 默认按批缓存分配，多节点非连续、重启跳号），加 `option (proto2mysql.tidb_auto_id_cache_one) = true;`（v6.4+ 集中分配）。
+
+**集群侧注意**（与本库无关但必须配置）：TiDB 单行 KV 默认上限 6MB（`txn-entry-size-limit`），本库的 MEDIUMBLOB 列可存到 16MB，大 blob 场景必须调大该配置，否则写入报 `entry too large`。
 
 ## 注意事项
 

@@ -63,6 +63,13 @@ type MessageTable struct {
 	autoIncreaseKey string   // 自增字段名
 	nullableFields  []string // 允许为NULL的字段
 
+	// TiDB 方言选项：以 /*T!*/ 扩展注释形式进入 DDL，MySQL 视为普通注释忽略，
+	// 同一份建表语句在 MySQL 与 TiDB 上均可执行（详见 proto/proto2mysql_option.proto 注释）
+	tidbNonclusteredPK  bool   // 主键追加 /*T![clustered_index] NONCLUSTERED */
+	tidbShardRowIDBits  uint32 // >0 时表尾追加 SHARD_ROW_ID_BITS=N
+	tidbPreSplitRegions uint32 // >0 时与 SHARD_ROW_ID_BITS 同块追加 PRE_SPLIT_REGIONS=N（无 shard 时忽略）
+	tidbAutoIDCacheOne  bool   // 表尾追加 /*T![auto_id_cache] AUTO_ID_CACHE=1 */
+
 	// 预生成的SQL片段（Init时构建，之后只读）
 	fieldsListSQL                string
 	selectFieldsSQL              string
@@ -399,7 +406,11 @@ func (m *MessageTable) GetCreateTableSQL() string {
 		for i, pk := range m.primaryKey {
 			primaryKeys[i] = escapeMySQLName(pk)
 		}
-		fields = append(fields, fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(primaryKeys, ",")))
+		pkClause := fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(primaryKeys, ","))
+		if m.tidbNonclusteredPK {
+			pkClause += tidbNonclusteredPKSQL
+		}
+		fields = append(fields, pkClause)
 	}
 
 	if len(m.indexes) > 0 {
@@ -428,9 +439,43 @@ func (m *MessageTable) GetCreateTableSQL() string {
 		stmt += ",\n" + strings.Join(indexes, ",\n")
 	}
 
-	// 表注释简化为表名
-	stmt += "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='" + escapeMySQLComment(m.tableName) + "';"
+	// 表注释简化为表名；TiDB 方言块按 TiDB 规范导出顺序放在 COMMENT 之前
+	stmt += "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci" + m.tidbTableOptionsSQL() + " COMMENT='" + escapeMySQLComment(m.tableName) + "';"
 	return stmt
+}
+
+// tidbNonclusteredPKSQL 主键的 TiDB 非聚簇声明（含前导空格）。
+// TiDB 扩展注释语法：TiDB 解析注释内容，MySQL 视为普通注释忽略。
+const tidbNonclusteredPKSQL = " /*T![clustered_index] NONCLUSTERED */"
+
+// tidbTableOptionsSQL 生成表级 TiDB 方言片段（含前导空格），无任何 TiDB 选项时返回空串。
+// 输出顺序与 TiDB SHOW CREATE TABLE 的规范导出一致（AUTO_ID_CACHE 块在前、SHARD 块在后、
+// 整体位于 COMMENT 之前），便于与线上表结构做文本 diff。
+// 两条 fail-safe（宁可忽略选项并告警，也不生成一条必然报错的 DDL）：
+//   - SHARD_ROW_ID_BITS 只支持非聚簇主键/无主键表：有主键却未声明 NONCLUSTERED 时忽略 shard（连带 preSplit）；
+//   - TiDB 要求 PRE_SPLIT_REGIONS ≤ SHARD_ROW_ID_BITS：超出时收敛到 shard 值。
+func (m *MessageTable) tidbTableOptionsSQL() string {
+	var sb strings.Builder
+	if m.tidbAutoIDCacheOne {
+		sb.WriteString(" /*T![auto_id_cache] AUTO_ID_CACHE=1 */")
+	}
+	shardBits := m.tidbShardRowIDBits
+	if shardBits > 0 && len(m.primaryKey) > 0 && !m.tidbNonclusteredPK {
+		log.Printf("proto2mysql: 表 %s 声明了 SHARD_ROW_ID_BITS 但主键未声明 NONCLUSTERED，TiDB 聚簇表不支持该选项，已忽略（请补 tidb_nonclustered_pk）", m.tableName)
+		shardBits = 0
+	}
+	if shardBits > 0 {
+		fmt.Fprintf(&sb, " /*T! SHARD_ROW_ID_BITS=%d", shardBits)
+		if pre := m.tidbPreSplitRegions; pre > 0 {
+			if pre > shardBits {
+				log.Printf("proto2mysql: 表 %s 的 PRE_SPLIT_REGIONS=%d 超过 SHARD_ROW_ID_BITS=%d，已收敛到 %d（TiDB 要求前者 ≤ 后者）", m.tableName, pre, shardBits, shardBits)
+				pre = shardBits
+			}
+			fmt.Fprintf(&sb, " PRE_SPLIT_REGIONS=%d", pre)
+		}
+		sb.WriteString(" */")
+	}
+	return sb.String()
 }
 
 // escapeMySQLComment 转义MySQL注释中的特殊字符（仅保留基础转义）
@@ -684,7 +729,12 @@ func (p *DB) syncTableSchema(registryKey string, table *MessageTable) error {
 			for i, pk := range table.primaryKey {
 				pkCols[i] = escapeMySQLName(pk)
 			}
-			alterSQLs = append(alterSQLs, fmt.Sprintf("ADD PRIMARY KEY (%s)", strings.Join(pkCols, ",")))
+			pkClause := fmt.Sprintf("ADD PRIMARY KEY (%s)", strings.Join(pkCols, ","))
+			if table.tidbNonclusteredPK {
+				// TiDB 补主键只能是非聚簇（省略关键字时默认即非聚簇），显式注释仅为语义自文档化；MySQL 视为注释忽略
+				pkClause += tidbNonclusteredPKSQL
+			}
+			alterSQLs = append(alterSQLs, pkClause)
 			log.Printf("table %s is missing its primary key; adding %s", table.tableName, strings.Join(pkCols, ","))
 		}
 	}
@@ -2295,6 +2345,33 @@ func WithNullableFields(fields ...string) TableOption {
 	return func(t *MessageTable) {
 		t.nullableFields = fields
 	}
+}
+
+// WithTiDBNonclusteredPK 主键追加 /*T![clustered_index] NONCLUSTERED */（TiDB 方言，MySQL 忽略）。
+// 业务自赋值的单调主键（如 Snowflake）在 TiDB 默认聚簇表下有写热点，须配合
+// WithTiDBShardRowIDBits 打散；代价是主键点查多一次索引回表。
+func WithTiDBNonclusteredPK() TableOption {
+	return func(t *MessageTable) { t.tidbNonclusteredPK = true }
+}
+
+// WithTiDBShardRowIDBits 追加 /*T! SHARD_ROW_ID_BITS=bits */（TiDB 方言，MySQL 忽略）。
+// 仅对非聚簇主键/无主键表生效：表有主键却未设置 WithTiDBNonclusteredPK 时本选项被忽略并告警
+// （TiDB 聚簇表不支持，生成了也必然建表失败）。bits 建议取 log2(TiKV 节点数) 数量级。
+func WithTiDBShardRowIDBits(bits uint32) TableOption {
+	return func(t *MessageTable) { t.tidbShardRowIDBits = bits }
+}
+
+// WithTiDBPreSplitRegions 建表即预切 region（TiDB 方言，MySQL 忽略）。
+// 依赖 WithTiDBShardRowIDBits，未设置时本选项被忽略；
+// TiDB 要求 n ≤ SHARD_ROW_ID_BITS，超出时收敛到 shard 值并告警。
+func WithTiDBPreSplitRegions(n uint32) TableOption {
+	return func(t *MessageTable) { t.tidbPreSplitRegions = n }
+}
+
+// WithTiDBAutoIDCacheOne 表尾追加 /*T![auto_id_cache] AUTO_ID_CACHE=1 */（TiDB 方言，MySQL 忽略）。
+// 自增 ID 走集中分配（v6.4+），近似连续；不设置时 TiDB 默认按批缓存（3 万/批，重启跳号）。
+func WithTiDBAutoIDCacheOne() TableOption {
+	return func(t *MessageTable) { t.tidbAutoIDCacheOne = true }
 }
 
 // Close 关闭数据库连接

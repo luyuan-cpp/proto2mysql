@@ -155,8 +155,8 @@ func TestSyncBackfillsMissingIndexes(t *testing.T) {
 	conn.queueRows(
 		rows(row(int64(1))),     // 表存在
 		golangTestAlignedCols(), // 列已对齐
-		rows(row(int64(1))),     // 有主键
 		nil,                     // 既有索引：一个都没有
+		rows(row(int64(1))),     // 有主键
 		nil,                     // ALTER 自身
 	)
 
@@ -393,4 +393,62 @@ func unsupportedKindDescriptor(t *testing.T) protoreflect.MessageDescriptor {
 		t.Fatalf("build descriptor: %v", err)
 	}
 	return fd.Messages().Get(0)
+}
+
+// TestNarrowingSuppressedDetection 区分"挡下了一次收窄"和"本来就一样"——只有前者该打日志。
+//
+// 收窄抑制是本库唯一「什么都不做、也什么都不说」的分支：改名有 warning、
+// ExpandOnly 违规有带语句清单的报错，唯独这里一声不吭——于是有人在 proto 里
+// 把 bigint 改回 int、期待列跟着变窄，结果什么也没发生，也没有任何线索。
+func TestNarrowingSuppressedDetection(t *testing.T) {
+	cases := []struct {
+		current, target string
+		want            bool
+		why             string
+	}{
+		{"bigint unsigned", "int unsigned NOT NULL DEFAULT 0", true, "整数族挡下收窄"},
+		{"mediumtext", "varchar(255)", true, "文本族挡下收窄"},
+		{"varchar(64)", "varchar(32)", true, "同类型挡下收窄"},
+		{"double", "float NOT NULL DEFAULT 0", true, "浮点族挡下收窄"},
+		{"datetime(6)", "DATETIME(3)", true, "精度挡下降级"},
+
+		{"int unsigned", "int unsigned NOT NULL DEFAULT 0", false, "本来就一样"},
+		{"int unsigned", "bigint unsigned NOT NULL DEFAULT 0", false, "需要拓宽，不是挡下收窄"},
+		{"mediumtext", "MEDIUMTEXT", false, "大小写不同但等价"},
+		{"bigint unsigned", "int NOT NULL DEFAULT 0", false, "有无符号是值域方向，不是宽窄"},
+	}
+	for _, c := range cases {
+		if got := narrowingSuppressed(c.current, c.target); got != c.want {
+			t.Errorf("narrowingSuppressed(%q, %q) = %v, 期望 %v（%s）",
+				c.current, c.target, got, c.want, c.why)
+		}
+	}
+}
+
+// TestSchemaSQLSortsByTableName schema.sql 必须按 **table_name** 排序，不是按注册键。
+//
+// 两者在没声明 table_name 选项时恰好相同，所以这个分叉长期看不出来；一旦用了
+// WithTableName，Go 按注册键排、Python 按表名排，**同一批语句会以不同顺序落进
+// schema.sql**——逐字节就不一致了，而现有 golden 是逐表断言、盖不到文件级顺序。
+func TestSchemaSQLSortsByTableName(t *testing.T) {
+	pdb := NewDB()
+	// 注册键是 proto full name（golang_test / golang_test1），但表名反着来：
+	// 按注册键排 → golang_test, golang_test1
+	// 按表名排   → aaa_second, zzz_first     ← 正确的是这个
+	pdb.RegisterTable(&testpb.GolangTest{}, WithTableName("zzz_first"))
+	pdb.RegisterTable(&testpb.GolangTest1{}, WithTableName("aaa_second"))
+
+	var buf strings.Builder
+	if err := pdb.WriteCreateTableSQL(&buf); err != nil {
+		t.Fatalf("WriteCreateTableSQL: %v", err)
+	}
+	out := buf.String()
+	first := strings.Index(out, "`aaa_second`")
+	second := strings.Index(out, "`zzz_first`")
+	if first < 0 || second < 0 {
+		t.Fatalf("两张表都该出现:\n%s", out)
+	}
+	if first > second {
+		t.Errorf("必须按 table_name 排序（aaa_second 在前），实际顺序相反:\n%s", out)
+	}
 }

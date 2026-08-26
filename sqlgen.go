@@ -21,14 +21,23 @@ func GenerateCreateTableSQL(m proto.Message, opts ...TableOption) string {
 // WriteCreateTableSQL 把所有已注册表的 CREATE TABLE 语句写入 w（按表名排序，输出稳定），
 // 用于离线生成 schema.sql，无需连库。建议在 RegisterTable 完成后调用。
 func (p *DB) WriteCreateTableSQL(w io.Writer) error {
-	names := make([]string, 0, len(p.Tables))
-	for name := range p.Tables {
-		names = append(names, name)
+	// 按 **table_name** 排序，不是按注册键（proto full name）。
+	//
+	// 两者在没声明 table_name 选项时恰好相同，所以这个分叉长期看不出来；一旦用了
+	// WithTableName（比如 proto 叫 game.v1.PlayerData、表叫 player_data），
+	// Go 按注册键排、Python 按表名排，**同一批语句会以不同顺序落进 schema.sql**——
+	// 逐字节就不一致了，而现有 golden 是逐表断言、盖不到文件级顺序。
+	//
+	// 排序键取 table_name：它才是真正出现在 SQL 里的东西，也是人看 schema.sql 时
+	// 会用来找表的东西。
+	tables := make([]*MessageTable, 0, len(p.Tables))
+	for _, table := range p.Tables {
+		tables = append(tables, table)
 	}
-	sort.Strings(names)
+	sort.Slice(tables, func(i, j int) bool { return tables[i].tableName < tables[j].tableName })
 
-	for _, name := range names {
-		if _, err := fmt.Fprintln(w, p.Tables[name].GetCreateTableSQL()); err != nil {
+	for _, table := range tables {
+		if _, err := fmt.Fprintln(w, table.GetCreateTableSQL()); err != nil {
 			return err
 		}
 		if _, err := fmt.Fprintln(w); err != nil {

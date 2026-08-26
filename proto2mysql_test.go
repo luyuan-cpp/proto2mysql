@@ -29,8 +29,34 @@ import (
 
 const integrationEnv = "PROTO2MYSQL_INTEGRATION"
 
-// GetMysqlConfig 读取testdata/db.json中的测试数据库连接配置
+// dsnEnv 允许用环境变量覆盖测试库地址，格式是 go-sql-driver 的 DSN：
+//
+//	user:pass@tcp(127.0.0.1:3306)/dbname
+//
+// 不设则回落到 testdata/db.json。加这个是因为原先**只能靠改那个已入库的文件**
+// 才能把测试指向别的库——于是每个人的本地凭据都会变成一次假 diff，
+// CI 上更是没法用。与 Python 侧的 PROTO2MYSQL_DSN 对齐。
+const dsnEnv = "PROTO2MYSQL_TEST_DSN"
+
+// GetMysqlConfig 读取测试数据库连接配置：优先 PROTO2MYSQL_TEST_DSN，其次 testdata/db.json。
 func GetMysqlConfig() *mysql.Config {
+	if dsn := os.Getenv(dsnEnv); dsn != "" {
+		cfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			log.Printf("解析 %s 失败: %v", dsnEnv, err)
+			return nil
+		}
+		// 与 NewMysqlConfig 保持同一套连接参数，避免两条路径行为不一致
+		if cfg.Params == nil {
+			cfg.Params = map[string]string{}
+		}
+		cfg.Params["charset"] = "utf8mb4"
+		cfg.ParseTime = true
+		cfg.MultiStatements = true
+		cfg.InterpolateParams = true
+		return cfg
+	}
+
 	file, err := os.Open("testdata/db.json")
 	defer func(file *os.File) {
 		if file != nil {
@@ -83,6 +109,19 @@ func mustOpenTestDB(t *testing.T, pdb *DB) *sql.DB {
 	}
 
 	return db
+}
+
+// isTiDB 后端是不是 TiDB。
+//
+// 按 VERSION() 判定而不是靠配置——TiDB 会把自己报成 "8.0.11-TiDB-v8.5.1"，
+// 也就是说它**声称自己是 MySQL 8.0**，光看主版本号分不出来。
+func isTiDB(t *testing.T, db *sql.DB) bool {
+	t.Helper()
+	var version string
+	if err := db.QueryRow("SELECT VERSION()").Scan(&version); err != nil {
+		t.Fatalf("查询版本失败: %v", err)
+	}
+	return strings.Contains(strings.ToLower(version), "tidb")
 }
 
 func closeTestDB(t *testing.T, db *sql.DB) {
@@ -165,6 +204,16 @@ func TestCreateOrUpdateTableBackfillsMissingPrimaryKey(t *testing.T) {
 
 	db := mustOpenTestDB(t, pdb)
 	defer closeTestDB(t, db)
+
+	// TiDB 上跳过：它**根本不支持给已存在的列加 AUTO_INCREMENT**（Error 8200），
+	// 合并一条、拆成两条都一样。这不是本库能修的，是 TiDB 的能力边界。
+	//
+	// 本库能做的已经做了：把补主键拆成独立的第二条 ALTER，这样 TiDB 上补主键失败时
+	// **列已经对齐好了**，服务能正常跑。早先它俩挤在一条里，一失败连列都加不上，
+	// 服务启动成功、第一条 SELECT 就 Error 1054。
+	if isTiDB(t, db) {
+		t.Skip("TiDB 不支持给已存在的列加 AUTO_INCREMENT（Error 8200）")
+	}
 
 	tableName := GetTableName(testTable)
 	escaped := escapeMySQLName(tableName)

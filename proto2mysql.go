@@ -828,6 +828,12 @@ func (m *MessageTable) buildAlterClauses(currentCols map[string]columnMeta, expa
 			// 类型不兼容，或旧表该列尚无字段号注释时，MODIFY 顺带回填注释
 			if !isTypeMatch(meta.colType, targetType) || meta.fieldNum != fieldNum {
 				alterSQLs = append(alterSQLs, fmt.Sprintf("MODIFY COLUMN %s %s%s", escapeMySQLName(fieldName), targetType, comment))
+			} else if narrowingSuppressed(meta.colType, targetType) {
+				// 什么都不做，但必须留痕：否则有人把 bigint 改回 int、期待列变窄，
+				// 结果什么也没发生，也没有任何线索告诉他为什么。
+				log.Printf("table %s: 列 %s 线上是 %s、proto 要 %s——**保持线上的不动**。"+
+					"收窄会丢数据，且在滚动发布期间会被新旧副本来回改。确实要收窄请人工写 ALTER",
+					m.tableName, fieldName, meta.colType, targetType)
 			}
 			delete(remaining, fieldName)
 			continue
@@ -880,6 +886,44 @@ func (m *MessageTable) buildAlterClauses(currentCols map[string]columnMeta, expa
 	}
 
 	return alterSQLs, nil
+}
+
+// narrowingSuppressed 本次"判为兼容"是不是**因为挡下了一次收窄**（而不是两边本来就一样）。
+//
+// 专门用来打日志。收窄抑制是本库唯一一个「什么都不做、也什么都不说」的分支：
+// 改名有 warning、ExpandOnly 违规有带语句清单的报错，唯独这里一声不吭——
+// 于是有人在 proto 里把 bigint 改回 int、期待列跟着变窄，结果什么也没发生，
+// 也没有任何线索告诉他为什么。
+//
+// 判据：类型确实不同，且线上那一侧更宽。
+func narrowingSuppressed(currentType, targetType string) bool {
+	current := parseMySQLType(currentType)
+	target := parseMySQLType(targetType)
+	currentBase := normalizeBaseType(current.baseType)
+	targetBase := normalizeBaseType(target.baseType)
+
+	if currentBase != targetBase {
+		for _, family := range typeFamilies {
+			c, okC := family.ranks[currentBase]
+			t, okT := family.ranks[targetBase]
+			if !okC || !okT {
+				continue
+			}
+			if family.isInteger && current.unsigned != target.unsigned {
+				return false // 值域方向不同，不是宽窄问题
+			}
+			return c > t
+		}
+		return false
+	}
+
+	switch currentBase {
+	case "varchar", "char", "datetime":
+		return current.length > target.length
+	case "float", "double":
+		return current.decimal > target.decimal
+	}
+	return false
 }
 
 // isRenameConvertible 线上旧列的类型，能不能安全承接改名后的新类型。
@@ -951,38 +995,6 @@ func (p *DB) syncTableSchema(registryKey string, table *MessageTable) error {
 		return err
 	}
 
-	// 补齐缺失的主键。
-	//
-	// buildAlterClauses 只对齐列（ADD/MODIFY/CHANGE COLUMN），从不看主键。
-	// 主键必须与列变更放进同一条 ALTER：主键列常同时带 AUTO_INCREMENT，若先单独
-	// MODIFY 成 AUTO_INCREMENT、再 ADD PRIMARY KEY，MySQL 会在第一条语句就报
-	// Error 1075（auto column must be defined as a key），永远到不了补主键那一步。
-	// 同一条 ALTER 也保证列对齐与补主键原子成功或失败。
-	//
-	// 这里只补“从无到有”，绝不自动 DROP/改写已有主键。ADD PRIMARY KEY 在已有
-	// 重复行时会失败；这是预期的 fail-closed 行为，调用方必须先人工去重再重试。
-	missingPrimaryKey := false
-	if len(table.primaryKey) > 0 {
-		hasPK, err := p.tableHasPrimaryKey(table.tableName)
-		if err != nil {
-			return fmt.Errorf("检查表 %s 主键存在性: %w", table.tableName, err)
-		}
-		if !hasPK {
-			missingPrimaryKey = true
-			pkCols := make([]string, len(table.primaryKey))
-			for i, pk := range table.primaryKey {
-				pkCols[i] = escapeMySQLName(pk)
-			}
-			pkClause := fmt.Sprintf("ADD PRIMARY KEY (%s)", strings.Join(pkCols, ","))
-			if table.tidbNonclusteredPK {
-				// TiDB 补主键只能是非聚簇（省略关键字时默认即非聚簇），显式注释仅为语义自文档化；MySQL 视为注释忽略
-				pkClause += tidbNonclusteredPKSQL
-			}
-			alterSQLs = append(alterSQLs, pkClause)
-			log.Printf("table %s is missing its primary key; adding %s", table.tableName, strings.Join(pkCols, ","))
-		}
-	}
-
 	// 补齐 proto 里声明了、但线上还没有的索引。
 	//
 	// 早先索引只出现在 CREATE TABLE 分支：表一旦建成，之后在 .proto 里新加
@@ -994,19 +1006,86 @@ func (p *DB) syncTableSchema(registryKey string, table *MessageTable) error {
 	}
 	alterSQLs = append(alterSQLs, indexClauses...)
 
-	// 执行ALTER TABLE（如果有需要修改的列或需要补主键）
+	// 补齐缺失的主键——**必须与列对齐分成两条 ALTER**。
+	//
+	// 主键列常同时带 AUTO_INCREMENT，而 MySQL 要求「自增列必须是键」：单独 MODIFY
+	// 成 AUTO_INCREMENT 会报 Error 1075，所以那条 MODIFY 必须与 ADD PRIMARY KEY 同句。
+	// 早先的做法是把它俩连同全部 ADD COLUMN 塞进**一条** ALTER，理由是
+	// "列对齐与补主键原子成功或失败"。
+	//
+	// 但 2026-08-26 在真 TiDB v8.5.1 上实测发现：**TiDB 根本不支持给已存在的列加
+	// AUTO_INCREMENT**（Error 8200 Unsupported modify column: can't set auto_increment），
+	// 合并一条、拆成两条都一样。于是那条 ALTER 整体失败，连带把所有 ADD COLUMN 一起废掉
+	// ——服务启动成功，第一条 SELECT 就 Error 1054 Unknown column，
+	// 而根因埋在一条看起来只是"补主键"的语句里。实测这一条根因产生了 6 个测试失败。
+	//
+	// 所以拆开：**列与索引一条、补主键另一条**。补主键失败时列已经对齐好了，
+	// 服务能正常跑，运维再单独处理主键。那点"原子性"换来的代价远大于收益。
+	//
+	// 这里只补"从无到有"，绝不自动 DROP/改写已有主键。
+	var pkClauses []string
+	if len(table.primaryKey) > 0 {
+		hasPK, err := p.tableHasPrimaryKey(table.tableName)
+		if err != nil {
+			return fmt.Errorf("检查表 %s 主键存在性: %w", table.tableName, err)
+		}
+		if !hasPK {
+			pkCols := make([]string, len(table.primaryKey))
+			for i, pk := range table.primaryKey {
+				pkCols[i] = escapeMySQLName(pk)
+			}
+
+			// 把主键列自己的 MODIFY（多半就是那条 AUTO_INCREMENT）挪到这一条里来，
+			// 否则它留在第一条 ALTER 里会因为"自增列还不是键"报 Error 1075。
+			var remaining []string
+			for _, clause := range alterSQLs {
+				moved := false
+				for _, pk := range table.primaryKey {
+					if strings.HasPrefix(clause, "MODIFY COLUMN "+escapeMySQLName(pk)+" ") {
+						pkClauses = append(pkClauses, clause)
+						moved = true
+						break
+					}
+				}
+				if !moved {
+					remaining = append(remaining, clause)
+				}
+			}
+			alterSQLs = remaining
+
+			pkClause := fmt.Sprintf("ADD PRIMARY KEY (%s)", strings.Join(pkCols, ","))
+			if table.tidbNonclusteredPK {
+				// TiDB 补主键只能是非聚簇（省略关键字时默认即非聚簇），显式注释仅为语义自文档化；MySQL 视为注释忽略
+				pkClause += tidbNonclusteredPKSQL
+			}
+			pkClauses = append(pkClauses, pkClause)
+			log.Printf("table %s is missing its primary key; adding %s", table.tableName, strings.Join(pkCols, ","))
+		}
+	}
+
+	// 第一条：列 + 索引
 	if len(alterSQLs) > 0 {
 		alterSQL := fmt.Sprintf("ALTER TABLE %s %s", escapeMySQLName(table.tableName), strings.Join(alterSQLs, ", "))
-		_, err := p.DB.ExecContext(p.context(), alterSQL)
-		if err != nil {
-			if missingPrimaryKey {
-				return fmt.Errorf("更新表 %s 结构并补齐主键失败(可能存在重复行，需先去重再重试): %w, SQL: %s",
-					table.tableName, err, alterSQL)
-			}
+		if _, err := p.DB.ExecContext(p.context(), alterSQL); err != nil {
 			return fmt.Errorf("更新表 %s 结构失败: %w, SQL: %s", table.tableName, err, alterSQL)
 		}
 		p.clearColumnCache(registryKey) // 清除缓存，下次查询时重新加载字段
 		p.awaitSchemaVisible(registryKey, table, alterSQLs)
+	}
+
+	// 第二条：补主键。失败时列已经对齐好了，服务能跑。
+	if len(pkClauses) > 0 {
+		pkSQL := fmt.Sprintf("ALTER TABLE %s %s", escapeMySQLName(table.tableName), strings.Join(pkClauses, ", "))
+		if _, err := p.DB.ExecContext(p.context(), pkSQL); err != nil {
+			return fmt.Errorf("表 %s 的列已对齐，但补齐主键失败: %w\n"+
+				"  SQL: %s\n"+
+				"  两个常见原因：\n"+
+				"    1) 线上已有重复行——先人工去重再重试（fail-closed，不会静默跳过）\n"+
+				"    2) 后端是 TiDB——它**不支持给已存在的列加 AUTO_INCREMENT**\n"+
+				"       （Error 8200），只能重建表或去掉 auto_increment_key 选项",
+				table.tableName, err, pkSQL)
+		}
+		p.clearColumnCache(registryKey)
 	}
 
 	return nil
@@ -2821,7 +2900,17 @@ const (
 // 不一定支持这个函数。所以拿不到只降级为"无锁执行 + 一条告警"——把可用性看得比
 // "锁一定要拿到"更重：拿不到锁最坏是撞 1060、重启自愈；因为拿不到锁就拒绝启动，
 // 是把一个并发问题升级成可用性事故。
+// disableSyncLockForTest 仅供**本包测试**用来验证锁真的在干活。
+//
+// 刻意不做成环境变量：那等于给生产环境留一个能关掉安全机制的开关。
+// 包内私有变量外部改不了，而负向测试能证明这条路径不是摆设——
+// 实测关掉锁后 8 个副本里 7 个直接撞 Error 1060。
+var disableSyncLockForTest bool
+
 func (p *DB) acquireSyncLock() bool {
+	if disableSyncLockForTest {
+		return false
+	}
 	var got sql.NullInt64
 	err := p.conn().QueryRow(
 		"SELECT GET_LOCK(?, ?)", SyncLockName, SyncLockTimeoutSeconds).Scan(&got)

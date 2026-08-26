@@ -2,6 +2,9 @@ package proto2mysql
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,4 +189,94 @@ func newTTLRecordingCache() *ttlRecordingCache {
 func (c *ttlRecordingCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	c.lastTTL = ttl
 	return c.fakeCache.Set(ctx, key, value, ttl)
+}
+
+// ── 并发边界（docs/concurrency.md） ──────────────────────────────────────
+//
+// 这一组测的是「P2MC 管什么、不管什么」。其中"丢失更新"那条是**故意断言坏行为**：
+// 它不是 bug，是整行 Save 的固有语义；写成测试是为了把这个失败模式钉死在代码里，
+// 免得有人以为加了 ODKU 就万事大吉。
+
+// TestSaveDoesNotTouchUnknownColumns v2 独有的列不会被 v1 的 Save 清零。
+//
+// ODKU 只更新点名的列，而列清单来自本进程的 descriptor —— 所以"本进程不认识的列"
+// 根本不会出现在语句里。
+func TestSaveDoesNotTouchUnknownColumns(t *testing.T) {
+	table := newMessageTable(&testpb.GolangTest{}, WithPrimaryKey("id"))
+	stmt, err := table.GetSaveSQLWithArgs(&testpb.GolangTest{Id: 7, Ip: "a"})
+	if err != nil {
+		t.Fatalf("GetSaveSQLWithArgs: %v", err)
+	}
+	for _, col := range []string{"id", "ip", "port", "group_id", "player", "player_id"} {
+		want := "`" + col + "` = VALUES(`" + col + "`)"
+		if !strings.Contains(stmt.Sql, want) {
+			t.Errorf("ODKU 应覆盖本进程认识的全部列，缺 %s: %s", want, stmt.Sql)
+		}
+	}
+	if strings.Contains(stmt.Sql, "level") {
+		t.Errorf("本进程不认识的列不该出现: %s", stmt.Sql)
+	}
+}
+
+// TestLostUpdateOnSharedFieldIsNotPrevented **共同字段的丢失更新，本库不防**。
+//
+// 时序（docs/concurrency.md 第三节）：
+//
+//	T1 v1 读到 port=100
+//	T2 v2 把 port 改成 200 并 Save
+//	T3 v1 只想改 ip，却用了整行 Save —— 它手里的 port 还是 100
+//	→ port=200 被盖回 100
+//
+// 要防必须自己选：UpdateFieldsByPK / IncrByPK / 乐观锁 / 行锁。
+func TestLostUpdateOnSharedFieldIsNotPrevented(t *testing.T) {
+	table := newMessageTable(&testpb.GolangTest{}, WithPrimaryKey("id"))
+	stale := &testpb.GolangTest{Id: 7, Ip: "Bob", Port: 100} // v1 手里的旧快照
+
+	stmt, err := table.GetSaveSQLWithArgs(stale)
+	if err != nil {
+		t.Fatalf("GetSaveSQLWithArgs: %v", err)
+	}
+	// port 确实被写进去了——哪怕调用方只想改 ip
+	if !strings.Contains(stmt.Sql, "`port` = VALUES(`port`)") {
+		t.Fatalf("整行 Save 应当写入 port: %s", stmt.Sql)
+	}
+	found := false
+	for _, a := range stmt.Args {
+		if fmt.Sprint(a) == "100" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("整行 Save 会把手里的旧 port 一起写回去——这正是丢失更新的来源")
+	}
+}
+
+// TestTransactionBypassesCacheOnRead 事务内**完全绕过缓存**。
+//
+// 要读到事务内自己刚写的最新值，走缓存就错了。这也是"缓存机制本身不会把未提交
+// 数据写进缓存"的一半原因，另一半是失效延迟到提交成功之后
+// （见 TestCacheInvalidateDeferredInTx）。
+func TestTransactionBypassesCacheOnRead(t *testing.T) {
+	cache := newFakeCache()
+	db := newCacheTestDB(cache)
+	table := db.Tables[GetTableName(&testpb.GolangTest{})]
+
+	// 缓存里放一条能命中的
+	cached := &testpb.GolangTest{Id: 9, Ip: "from-cache"}
+	db.cacheSetProto(table, cached)
+
+	// 事务外：命中缓存
+	out := &testpb.GolangTest{Id: 9}
+	if !db.cacheGetProto(table, out) {
+		t.Fatal("事务外应当命中缓存")
+	}
+
+	// 事务内：useCache 必须为 false
+	txDB := &DB{Tables: db.Tables, cache: db.cache, cacheTTL: db.cacheTTL, tx: new(sql.Tx)}
+	if txDB.cacheEnabled() && txDB.tx == nil {
+		t.Fatal("事务内的 useCache 判定应当为 false")
+	}
+	if !txDB.cacheEnabled() {
+		t.Fatal("事务内缓存本身仍然是启用的，只是读路径不走它")
+	}
 }

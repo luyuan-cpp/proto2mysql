@@ -1,12 +1,14 @@
 package proto2mysql
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	testpb "github.com/luyuancpp/proto2mysql/internal/testpb"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -34,17 +36,27 @@ func golangTestAlignedCols() [][]driver.Value {
 	)
 }
 
+// queueLockedSchemaSync 给单表 schema 入口排一组成功的咨询锁结果，业务结果集放在中间。
+// GET_LOCK/RELEASE_LOCK 与元数据查询共享同一 fakeConn，因此队列顺序也能证明连接被钉住。
+func queueLockedSchemaSync(conn *fakeConn, sets ...[][]driver.Value) {
+	locked := make([][][]driver.Value, 0, len(sets)+2)
+	locked = append(locked, rows(row(int64(1))))
+	locked = append(locked, sets...)
+	locked = append(locked, rows(row(int64(1))))
+	conn.queueRows(locked...)
+}
+
 // TestSyncCreatesTableThenStillAligns 对应 fixes-2026-08 第 8 条。
 //
 // 建表分支**刻意不 return**：CREATE TABLE IF NOT EXISTS 在并发下可能整条是 no-op，
 // 早先直接 return 会让本进程独有的新列从未被添加，而进程启动成功、零异常。
 func TestSyncCreatesTableThenStillAligns(t *testing.T) {
 	pdb, conn := newFakeDB(t)
-	conn.queueRows(
+	queueLockedSchemaSync(conn,
 		rows(row(int64(0))),     // is_table_exists → 不存在
 		nil,                     // CREATE TABLE 自身
 		golangTestAlignedCols(), // 建完回读：已对齐
-		rows(row(int64(1))),     // 有主键
+		rows(indexRow("PRIMARY", true, 1, "id", nil)), // 主键就是 id
 	)
 
 	if err := pdb.CreateOrUpdateTable(&testpb.GolangTest{}); err != nil {
@@ -71,11 +83,11 @@ func TestSyncCreatesTableThenStillAligns(t *testing.T) {
 func TestSyncStillAlignsWhenCreateWasNoop(t *testing.T) {
 	pdb, conn := newFakeDB(t)
 	older := golangTestAlignedCols()[:5] // 别人建的旧结构：缺 player_id(pb:6)
-	conn.queueRows(
+	queueLockedSchemaSync(conn,
 		rows(row(int64(0))), // 检查时表还不存在
 		nil,                 // CREATE（实际是 no-op，已被别人建走）
 		older,               // 回读到别人建的旧结构
-		rows(row(int64(1))), // 有主键
+		rows(indexRow("PRIMARY", true, 1, "id", nil)), // 主键就是 id
 	)
 
 	if err := pdb.CreateOrUpdateTable(&testpb.GolangTest{}); err != nil {
@@ -90,6 +102,69 @@ func TestSyncStillAlignsWhenCreateWasNoop(t *testing.T) {
 	}
 }
 
+func TestSingleTableSyncTakesAdvisoryLock(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*DB) error
+	}{
+		{"CreateOrUpdateTable", func(pdb *DB) error { return pdb.CreateOrUpdateTable(&testpb.GolangTest{}) }},
+		{"UpdateTableField", func(pdb *DB) error { return pdb.UpdateTableField(&testpb.GolangTest{}) }},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pdb, conn := newFakeDB(t)
+			queueLockedSchemaSync(conn,
+				rows(row(int64(1))),
+				golangTestAlignedCols(),
+				rows(indexRow("PRIMARY", true, 1, "id", nil)),
+			)
+
+			if err := tc.run(pdb); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			all := conn.sqls()
+			if conn.countSQL("GET_LOCK") != 1 || conn.countSQL("RELEASE_LOCK") != 1 {
+				t.Fatalf("单表同步必须恰好抢锁并释放一次，SQL: %v", all)
+			}
+			if len(all) == 0 || !strings.Contains(all[0], "GET_LOCK") ||
+				!strings.Contains(all[len(all)-1], "RELEASE_LOCK") {
+				t.Fatalf("咨询锁必须包住单表同步的完整临界区，SQL: %v", all)
+			}
+		})
+	}
+}
+
+func TestCoreSchemaSyncRejectsBusinessTransaction(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*DB) error
+	}{
+		{name: "UpdateTableField", run: func(tx *DB) error {
+			return tx.UpdateTableField(&testpb.GolangTest{})
+		}},
+		{name: "CreateOrUpdateTable", run: func(tx *DB) error {
+			return tx.CreateOrUpdateTable(&testpb.GolangTest{})
+		}},
+		{name: "SyncAllTables", run: func(tx *DB) error {
+			return tx.SyncAllTables()
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pdb, conn := newFakeDB(t)
+			err := pdb.RunInTransaction(func(tx *DB) error { return tc.run(tx) })
+			if !errors.Is(err, ErrSchemaSyncInTransaction) {
+				t.Fatalf("事务内结构同步必须 fail-closed，实际: %v", err)
+			}
+			if got := conn.sqls(); len(got) != 0 {
+				t.Fatalf("事务内拒绝前不得抢咨询锁或执行 DDL，SQL=%v", got)
+			}
+		})
+	}
+}
+
 // TestSyncTakesAdvisoryLock 对应 fixes-2026-08 第 11 条。
 //
 // 结构同步全程持一把 GET_LOCK，避免 N 个副本同时 ALTER 撞 Error 1060
@@ -97,11 +172,11 @@ func TestSyncStillAlignsWhenCreateWasNoop(t *testing.T) {
 func TestSyncTakesAdvisoryLock(t *testing.T) {
 	pdb, conn := newFakeDB(t)
 	conn.queueRows(
-		rows(row(int64(1))),     // GET_LOCK → 1
-		rows(row(int64(1))),     // 表存在
-		golangTestAlignedCols(), // 已对齐
-		rows(row(int64(1))),     // 有主键
-		rows(row(int64(1))),     // RELEASE_LOCK
+		rows(row(int64(1))),                           // GET_LOCK → 1
+		rows(row(int64(1))),                           // 表存在
+		golangTestAlignedCols(),                       // 已对齐
+		rows(indexRow("PRIMARY", true, 1, "id", nil)), // 主键就是 id
+		rows(row(int64(1))),                           // RELEASE_LOCK
 	)
 
 	if err := pdb.SyncAllTables(); err != nil {
@@ -116,25 +191,124 @@ func TestSyncTakesAdvisoryLock(t *testing.T) {
 	}
 }
 
-// TestSyncDegradesWhenLockUnavailable 拿不到锁只降级 + 告警，不阻断。
-//
-// 可用性比"锁一定要拿到"更重要：拿不到锁最坏是撞 1060、重启自愈；
-// 而因为拿不到锁就拒绝启动，是把并发问题升级成可用性事故。
-// TiDB 等兼容实现也不一定支持 GET_LOCK。
-func TestSyncDegradesWhenLockUnavailable(t *testing.T) {
+// TestSyncStopsWhenLockTimesOut GET_LOCK=0 明确表示另一个同步仍持锁。
+// 此时继续无锁执行会把被锁保护的并发 DDL 原样重新引入，必须中止本轮同步。
+func TestSyncStopsWhenLockTimesOut(t *testing.T) {
 	pdb, conn := newFakeDB(t)
-	conn.queueRows(
-		rows(row(int64(0))),     // GET_LOCK → 0，等超时了
-		rows(row(int64(1))),     // 表存在
-		golangTestAlignedCols(), // 已对齐
-		rows(row(int64(1))),     // 有主键
-	)
+	conn.queueRows(rows(row(int64(0)))) // GET_LOCK → 0，锁竞争超时
 
-	if err := pdb.SyncAllTables(); err != nil {
-		t.Fatalf("拿不到锁不应阻断启动: %v", err)
+	err := pdb.SyncAllTables()
+	if err == nil || !strings.Contains(err.Error(), "DDL 咨询锁") {
+		t.Fatalf("锁竞争超时必须以可识别错误中止同步，实际: %v", err)
 	}
 	if conn.countSQL("RELEASE_LOCK") != 0 {
 		t.Error("没拿到锁就不该去释放")
+	}
+	if conn.countSQL("INFORMATION_SCHEMA") != 0 {
+		t.Fatalf("没拿到锁时不得继续无锁读取/修改结构，SQL: %v", conn.sqls())
+	}
+}
+
+func TestSyncStopsWhenLockResultIsNull(t *testing.T) {
+	pdb, conn := newFakeDB(t)
+	conn.queueRows(rows(row(nil)))
+
+	err := pdb.SyncAllTables()
+	if err == nil || !strings.Contains(err.Error(), "DDL 咨询锁") {
+		t.Fatalf("GET_LOCK=NULL 表示错误，必须中止同步，实际: %v", err)
+	}
+	if conn.countSQL("INFORMATION_SCHEMA") != 0 {
+		t.Fatalf("GET_LOCK=NULL 后不得继续无锁同步，SQL: %v", conn.sqls())
+	}
+}
+
+func TestSyncStopsOnUnexpectedLockQueryError(t *testing.T) {
+	pdb, conn := newFakeDB(t)
+	want := errors.New("lock connection reset")
+	conn.failNext = want
+
+	err := pdb.SyncAllTables()
+	if !errors.Is(err, want) {
+		t.Fatalf("连接/查询错误不得伪装成“不支持锁”并降级，实际: %v", err)
+	}
+	if conn.countSQL("INFORMATION_SCHEMA") != 0 {
+		t.Fatalf("锁查询失败后不得继续无锁同步，SQL: %v", conn.sqls())
+	}
+}
+
+func TestSyncDegradesOnlyWhenGetLockIsUnsupported(t *testing.T) {
+	pdb, conn := newFakeDB(t)
+	conn.failNext = &mysqldriver.MySQLError{Number: 1305, Message: "FUNCTION GET_LOCK does not exist"}
+	conn.queueRows(
+		rows(row(int64(1))),                           // 表存在
+		golangTestAlignedCols(),                       // 已对齐
+		rows(indexRow("PRIMARY", true, 1, "id", nil)), // 主键就是 id
+	)
+
+	if err := pdb.SyncAllTables(); err != nil {
+		t.Fatalf("后端明确不支持 GET_LOCK 时允许有边界地无锁降级: %v", err)
+	}
+	if conn.countSQL("RELEASE_LOCK") != 0 {
+		t.Error("未取得锁时不应释放")
+	}
+}
+
+func TestDependentIndexMovesWithMissingAutoIncrementPrimaryKeyColumn(t *testing.T) {
+	table := newMessageTable(&testpb.GolangTest{},
+		WithPrimaryKey("id"), WithAutoIncrementKey("id"), WithIndexes("id,port"))
+	plan, err := table.planSchemaAlignment(map[string]columnMeta{
+		"port": {colType: "int unsigned", fieldNum: 3},
+	}, map[string]indexMeta{}, true, nil, false)
+	if err != nil {
+		t.Fatalf("planSchemaAlignment: %v", err)
+	}
+
+	first := strings.Join(plan.columns, " | ")
+	second := strings.Join(plan.primaryKey, " | ")
+	if strings.Contains(first, "ADD INDEX") && strings.Contains(first, "`id`") {
+		t.Fatalf("第一条 ALTER 不能先创建依赖尚不存在 id 列的索引: %s", first)
+	}
+	if !strings.Contains(second, "ADD COLUMN `id`") ||
+		!strings.Contains(second, "ADD PRIMARY KEY (`id`)") ||
+		!strings.Contains(second, "ADD INDEX") {
+		t.Fatalf("自增列、主键及依赖索引必须在同一条 ALTER 中，实际: %s", second)
+	}
+}
+
+// TestSyncLockIsNamespacedByDatabase MySQL 用户锁是整个 server 实例共享的；
+// 两个完全无关的库若都叫固定 proto2mysql:sync，会互相白等 30 秒。
+func TestSyncLockIsNamespacedByDatabase(t *testing.T) {
+	a := NewDB()
+	a.DBName = "game_a"
+	b := NewDB()
+	b.DBName = "game_b"
+	if a.syncLockName() == b.syncLockName() {
+		t.Fatalf("不同数据库不得共享 DDL 锁名: %q", a.syncLockName())
+	}
+	if a.syncLockName() != a.syncLockName() {
+		t.Fatal("同一数据库的锁名必须稳定")
+	}
+}
+
+// TestReleaseSyncLockIgnoresCanceledRequestContext 同步请求超时后仍必须尝试释放锁。
+// 用已经取消的请求 ctx 调 database/sql 会在驱动前直接失败；释放需独立短超时 ctx。
+func TestReleaseSyncLockIgnoresCanceledRequestContext(t *testing.T) {
+	sqlDB, fake := openFakeDB()
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	conn, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("Conn: %v", err)
+	}
+	fake.queueRows(rows(row(int64(1))))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	pdb := NewDB()
+	pdb.DB = sqlDB
+	pdb.DBName = "game"
+	pdb.ctx = ctx
+	pdb.releaseSyncLock(conn)
+	if fake.countSQL("RELEASE_LOCK") != 1 {
+		t.Fatalf("请求 ctx 已取消也必须释放锁，实际 SQL: %v", fake.sqls())
 	}
 }
 
@@ -152,12 +326,12 @@ func TestSyncBackfillsMissingIndexes(t *testing.T) {
 	pdb.RegisterTable(&testpb.GolangTest{},
 		WithPrimaryKey("id"), WithIndexes("player_id"), WithUniqueKey("ip"))
 
-	conn.queueRows(
+	queueLockedSchemaSync(conn,
 		rows(row(int64(1))),     // 表存在
 		golangTestAlignedCols(), // 列已对齐
 		nil,                     // 既有索引：一个都没有
-		rows(row(int64(1))),     // 有主键
-		nil,                     // ALTER 自身
+		rows(indexRow("PRIMARY", true, 1, "id", nil)), // 主键就是 id
+		nil, // ALTER 自身
 	)
 
 	if err := pdb.CreateOrUpdateTable(&testpb.GolangTest{}); err != nil {
@@ -176,19 +350,23 @@ func TestSyncBackfillsMissingIndexes(t *testing.T) {
 	}
 }
 
-// TestSyncSkipsIndexQueryWhenNoneDeclared proto 里没声明索引时不必去查 information_schema。
-func TestSyncSkipsIndexQueryWhenNoneDeclared(t *testing.T) {
+// TestSyncSkipsSecondaryIndexQueryWhenNoneDeclared proto 里没声明二级索引时不必读取它们；
+// 主键仍需从 STATISTICS 读取 SUB_PART 才能校验前缀定义。
+func TestSyncSkipsSecondaryIndexQueryWhenNoneDeclared(t *testing.T) {
 	pdb, conn := newFakeDB(t) // 只有主键，没有 index/unique_key
-	conn.queueRows(
+	queueLockedSchemaSync(conn,
 		rows(row(int64(1))),
 		golangTestAlignedCols(),
-		rows(row(int64(1))),
+		rows(indexRow("PRIMARY", true, 1, "id", nil)),
 	)
 	if err := pdb.CreateOrUpdateTable(&testpb.GolangTest{}); err != nil {
 		t.Fatalf("CreateOrUpdateTable: %v", err)
 	}
-	if conn.countSQL("INFORMATION_SCHEMA.STATISTICS") != 0 {
-		t.Error("没声明索引时不该查 STATISTICS")
+	if conn.countSQL("INDEX_NAME <> 'PRIMARY'") != 0 {
+		t.Error("没声明二级索引时不该扫描二级索引")
+	}
+	if conn.countSQL("INDEX_NAME = 'PRIMARY'") != 1 {
+		t.Error("声明了主键时必须读取 PRIMARY 的完整定义")
 	}
 }
 
@@ -267,12 +445,12 @@ func TestUnsupportedFieldKindFailsFast(t *testing.T) {
 	}
 }
 
-// TestByFieldNumIsDeterministic 对应 fixes-2026-08 第 10 条（Go 独有）。
+// TestDuplicateFieldNumberMetadataFailsClosed 对应 fixes-2026-08 第 10 条（Go 独有）。
 //
 // byFieldNum 早先是边遍历 map 边写的，而 Go 的 map 迭代顺序是随机化的。
 // 线上出现两列带同一个 pb:N 时（DBA 照 SHOW CREATE TABLE 复制个备份列就会），
-// 每次运行挑中的列都可能不同——同一份 proto 跑两次得到两份 DDL。
-func TestByFieldNumIsDeterministic(t *testing.T) {
+// 仅做确定性挑选仍可能把备份列改成正式列；字段身份歧义时必须拒绝自动迁移。
+func TestDuplicateFieldNumberMetadataFailsClosed(t *testing.T) {
 	table := newMessageTable(&testpb.GolangTest{}, WithPrimaryKey("id"))
 	ipType := table.getMySQLFieldType(table.Descriptor.Fields().ByName("ip"))
 
@@ -282,24 +460,13 @@ func TestByFieldNumIsDeterministic(t *testing.T) {
 		"zz_ip":        {colType: ipType, fieldNum: 2},
 	}, "ip")
 
-	var first string
-	for i := 0; i < 20; i++ {
-		clauses, err := table.buildAlterClauses(current, false)
-		if err != nil {
-			t.Fatalf("buildAlterClauses: %v", err)
-		}
-		joined := strings.Join(clauses, " | ")
-		if i == 0 {
-			first = joined
-			continue
-		}
-		if joined != first {
-			t.Fatalf("同一输入必须产出同一份 DDL，第 %d 次不同:\n%s\n%s", i, first, joined)
-		}
+	clauses, err := table.buildAlterClauses(current, false)
+	if !errors.Is(err, ErrSchemaDrift) {
+		t.Fatalf("重复 pb:N 必须 fail-closed，clauses=%v err=%v", clauses, err)
 	}
-	// 冲突时取列名字典序最小的那个
-	if !strings.Contains(first, "CHANGE COLUMN `aa_ip_backup` `ip`") {
-		t.Errorf("冲突时应取字典序最小的列: %s", first)
+	if !strings.Contains(err.Error(), "aa_ip_backup") || !strings.Contains(err.Error(), "zz_ip") ||
+		!strings.Contains(err.Error(), "pb:2") {
+		t.Errorf("错误应指出全部冲突列和字段号: %v", err)
 	}
 }
 

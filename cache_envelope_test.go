@@ -3,12 +3,14 @@ package proto2mysql
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	testpb "github.com/luyuancpp/proto2mysql/internal/testpb"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -125,6 +127,77 @@ func TestCorruptCacheEntryDoesNotClobberPrimaryKey(t *testing.T) {
 	}
 }
 
+// rawCacheEntry 生成一个只含信封头和字段号、payload 为空的测试条目。
+// nums 不自动排序，调用方可以用它覆盖乱序/重复输入。
+func rawCacheEntry(count uint64, nums ...uint64) []byte {
+	data := append(append([]byte{}, cacheEntryMagic...), cacheEntryVersion)
+	data = binary.AppendUvarint(data, count)
+	for _, num := range nums {
+		data = binary.AppendUvarint(data, num)
+	}
+	return data
+}
+
+// TestDecodeCacheEntryRejectsImpossibleCountWithoutPanic count 来自外部缓存，
+// 不能在验证前直接拿去做 make(map, count)。一个十几字节的坏条目不应把进程打崩
+// 或诱导巨额分配，只能安全地降级为 cache miss。
+func TestDecodeCacheEntryRejectsImpossibleCountWithoutPanic(t *testing.T) {
+	data := rawCacheEntry(^uint64(0))
+
+	var (
+		ok       bool
+		panicVal any
+	)
+	func() {
+		defer func() { panicVal = recover() }()
+		_, _, ok = decodeCacheEntry(data)
+	}()
+
+	if panicVal != nil {
+		t.Fatalf("损坏的字段计数不得触发 panic: %v", panicVal)
+	}
+	if ok {
+		t.Fatal("字段计数大于剩余字节数的信封必须判为损坏")
+	}
+}
+
+// TestDecodeCacheEntryRejectsUnreasonableFieldCount 即使输入真的附带了同等数量的
+// varint，也不能让一个缓存条目把字段集合放大到无界。65536 已远高于 MySQL 单表可承载
+// 的字段数，保留充足余量；再多一项必须在建 map 前拒绝。
+func TestDecodeCacheEntryRejectsUnreasonableFieldCount(t *testing.T) {
+	const count = 65537
+	nums := make([]uint64, count)
+	for i := range nums {
+		nums[i] = uint64(i + 1)
+	}
+	if _, _, ok := decodeCacheEntry(rawCacheEntry(count, nums...)); ok {
+		t.Fatal("不合理的超大字段集合必须判为损坏")
+	}
+}
+
+// TestDecodeCacheEntryRejectsInvalidFieldNumbers 信封声明的是 protobuf 字段集合，
+// 因此字段号必须合法、严格递增且不重复；否则 int32 截断可能把超大字段号伪装成
+// 当前 schema 认识的字段，绕过残缺条目的超集判定。
+func TestDecodeCacheEntryRejectsInvalidFieldNumbers(t *testing.T) {
+	tests := []struct {
+		name string
+		nums []uint64
+	}{
+		{name: "zero", nums: []uint64{0}},
+		{name: "above protobuf maximum", nums: []uint64{uint64(protowire.MaxValidNumber) + 1}},
+		{name: "duplicate", nums: []uint64{1, 1}},
+		{name: "descending", nums: []uint64{2, 1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, ok := decodeCacheEntry(rawCacheEntry(uint64(len(tt.nums)), tt.nums...)); ok {
+				t.Fatalf("非法字段号集合被当成有效信封: %v", tt.nums)
+			}
+		})
+	}
+}
+
 // TestCacheSetWritesEnvelope 写路径必须带上信封，否则读路径永远认不出来。
 func TestCacheSetWritesEnvelope(t *testing.T) {
 	cache := newFakeCache()
@@ -176,6 +249,38 @@ func TestCacheTTLIsPassedThrough(t *testing.T) {
 	}
 }
 
+// TestCacheKeySeparatesTableNameFromPrimaryKeyParts 表名与主键分量共享 ':' 分隔符，
+// 两边必须使用同一套无歧义编码。只转义主键仍会留下跨表碰撞：
+//
+//	table="a:1", pk=(2)   -> pb:a:1:2
+//	table="a",   pk=(1,2) -> pb:a:1:2
+//
+// 两张不同的表一旦共享 key，读取、覆盖和失效都会串到另一张表。
+func TestCacheKeySeparatesTableNameFromPrimaryKeyParts(t *testing.T) {
+	colonTable := NewDB()
+	colonTable.RegisterTable(&testpb.GolangTest{},
+		WithTableName("a:1"), WithPrimaryKey("id"))
+	colonKey, err := colonTable.CacheKey(&testpb.GolangTest{Id: 2})
+	if err != nil {
+		t.Fatalf("生成含冒号表名的缓存 key: %v", err)
+	}
+
+	compositeTable := NewDB()
+	compositeTable.RegisterTable(&testpb.GolangTest{},
+		WithTableName("a"), WithPrimaryKey("id", "port"))
+	compositeKey, err := compositeTable.CacheKey(&testpb.GolangTest{Id: 1, Port: 2})
+	if err != nil {
+		t.Fatalf("生成复合主键缓存 key: %v", err)
+	}
+
+	if colonKey == compositeKey {
+		t.Fatalf("不同表/主键塌成了同一个缓存 key: %q", colonKey)
+	}
+	if colonKey != "pb:a%3A1:2" {
+		t.Errorf("含冒号的表名必须编码，实际 key=%q", colonKey)
+	}
+}
+
 // ttlRecordingCache 记录最后一次 Set 用的 ttl。
 type ttlRecordingCache struct {
 	fakeCache
@@ -207,11 +312,17 @@ func TestSaveDoesNotTouchUnknownColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSaveSQLWithArgs: %v", err)
 	}
-	for _, col := range []string{"id", "ip", "port", "group_id", "player", "player_id"} {
-		want := "`" + col + "` = VALUES(`" + col + "`)"
+	// 主键**不在**这个列表里：ODKU 在任意唯一键冲突时都会触发，命中的可能是主键
+	// 不同的另一行，带上 `id` = VALUES(`id`) 会把那一行的主键就地改掉。
+	// 详见 valuesUpdateClause 的注释。
+	for _, col := range []string{"ip", "port", "group_id", "player", "player_id"} {
+		want := "`" + col + "` = IF(`id` <=> VALUES(`id`), VALUES(`" + col + "`), `" + col + "`)"
 		if !strings.Contains(stmt.Sql, want) {
-			t.Errorf("ODKU 应覆盖本进程认识的全部列，缺 %s: %s", want, stmt.Sql)
+			t.Errorf("ODKU 应覆盖本进程认识的全部非主键列，缺 %s: %s", want, stmt.Sql)
 		}
+	}
+	if strings.Contains(stmt.Sql, "`id` = VALUES(`id`)") {
+		t.Errorf("主键绝不能出现在 ODKU 的 SET 里（会顶替命中行的身份）: %s", stmt.Sql)
 	}
 	if strings.Contains(stmt.Sql, "level") {
 		t.Errorf("本进程不认识的列不该出现: %s", stmt.Sql)
@@ -237,7 +348,7 @@ func TestLostUpdateOnSharedFieldIsNotPrevented(t *testing.T) {
 		t.Fatalf("GetSaveSQLWithArgs: %v", err)
 	}
 	// port 确实被写进去了——哪怕调用方只想改 ip
-	if !strings.Contains(stmt.Sql, "`port` = VALUES(`port`)") {
+	if !strings.Contains(stmt.Sql, "`port` = IF(`id` <=> VALUES(`id`), VALUES(`port`), `port`)") {
 		t.Fatalf("整行 Save 应当写入 port: %s", stmt.Sql)
 	}
 	found := false

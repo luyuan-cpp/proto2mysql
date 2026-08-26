@@ -9,7 +9,7 @@
 | 风险 | P2MC 能否防住 | 当前实际情况 |
 |---|---:|---|
 | v1 缓存缺少 v2 新字段 | ✅ | v2 判定不是超集 → 当未命中回源 |
-| v1 把 v2 独有的数据库列清零 | 通常能避免 | `Save()` 用 ODKU，不更新 v1 不认识的列 |
+| v1 把 v2 独有的数据库列清零 | 通常能避免 | `Save()` 的主键 UPDATE 不更新 v1 不认识的列 |
 | **v1/v2 同时改共同字段，后写覆盖先写** | ❌ | **可能发生**，要靠乐观锁/原子语句自己防 |
 | **cache-aside 并发产生陈旧缓存** | ❌ | **可能发生**，要靠有限 TTL 兜底 |
 | SQL 脏读、幻读 | ❌ | 由数据库事务隔离级别决定，本库不介入 |
@@ -31,13 +31,16 @@ v2 认识的字段：id、name、gold、level
 数据库当前：   name=Alice, gold=100, level=42
 ```
 
-v1 调 `Save()` 时，底层发的是：
+v1 调 `Save()` 时，底层先按完整主键更新：
 
 ```sql
-INSERT ... ON DUPLICATE KEY UPDATE
-    name = VALUES(name),
-    gold = VALUES(gold)
+UPDATE player
+SET name = ?, gold = ?
+WHERE id = ?
 ```
+
+若主键不存在才执行 `INSERT`；并发同主键插入会重试一次 UPDATE。备用唯一键撞到
+主键不同的另一行时返回 `ErrDuplicateKey`，不会借 ODKU 去改那一行。
 
 v1 不认识 `level`，SQL 里就不会提到它，所以：
 
@@ -195,7 +198,7 @@ SELECT * FROM player WHERE level >= 10;   -- 两次之间别人插了一行
 
 ```
 P2MC          → 只管"缓存条目的字段集合完不完整"
-ODKU (save)   → 只管"不碰我不认识的列"
+PK Save       → 只管"不碰我不认识的列"和"不改错身份"
 乐观锁/原子语句 → 管"共同字段的并发写"        ← 你必须自己选
 TTL           → 管"缓存值陈旧"                ← 你必须自己设
 隔离级别      → 管"脏读/幻读"                 ← 数据库的事

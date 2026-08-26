@@ -50,6 +50,9 @@ func SerializeFieldValue(message proto.Message, fieldDesc protoreflect.FieldDesc
 // 非法UTF-8被拒或损坏——本库建表时bytes/message/map/list统一映射为MEDIUMBLOB，
 // 只有手工建的表才可能踩到。
 func SerializeFieldAsString(message proto.Message, fieldDesc protoreflect.FieldDescriptor) (string, error) {
+	if err := rejectRealOneof(fieldDesc); err != nil {
+		return "", err
+	}
 	reflection := message.ProtoReflect()
 
 	if isTimestampField(fieldDesc) {
@@ -179,11 +182,29 @@ func isTimestampField(fd protoreflect.FieldDescriptor) bool {
 		fd.Message().FullName() == timestampFullName
 }
 
+// rejectRealOneof 拒绝非 synthetic oneof 成员。本库把每个字段映射成独立列，
+// 没有“未选中”状态：写入会把未选中成员也落成零值，读取逐个 Set 又会让最后一个
+// 成员恒胜。proto3 optional 使用的 synthetic oneof 只表达 presence，正常放行。
+func rejectRealOneof(fieldDesc protoreflect.FieldDescriptor) error {
+	if oneof := fieldDesc.ContainingOneof(); oneof != nil && !oneof.IsSynthetic() {
+		return fmt.Errorf("%w: field %s belongs to unsupported oneof %q",
+			ErrInvalidFieldKind, fieldDesc.Name(), oneof.Name())
+	}
+	return nil
+}
+
 // ParseFromString 按字段声明顺序，把一行查询结果（字符串切片）反序列化到消息中。
 // row[i]对应消息的第i个字段，与SerializeFieldAsString生成的格式对称。
 func ParseFromString(message proto.Message, row []string) error {
 	reflection := message.ProtoReflect()
 	fields := reflection.Descriptor().Fields()
+	// 必须先完整预检再修改 message。否则遇到 oneof 时前面的普通字段已经被覆盖，
+	// 调用方即使收到 error，也拿不回传入时的主键/原值。
+	for i := 0; i < fields.Len(); i++ {
+		if err := rejectRealOneof(fields.Get(i)); err != nil {
+			return err
+		}
+	}
 
 	count := fields.Len()
 	if len(row) < count {
@@ -301,8 +322,24 @@ func parseTimestamp(reflection protoreflect.Message, fieldDesc protoreflect.Fiel
 	return nil
 }
 
-// parseContainer 反序列化map/list字段（serializeContainer的逆操作）
+// parseContainer 反序列化map/list字段（serializeContainer的逆操作）。
+//
+// **必须先清空目标字段**，理由与 setScalarDefault 那段完全一致：调用方复用同一个
+// message 连续读多行是本 API 的天然用法（FindOneByPK 的入参即出参）。原先有两条
+// 路径会带着上一行的内容返回：
+//
+//	raw == ""               → 直接 return，上一行的 map/list 原封不动留着
+//	holder.Has 为 false     → 同上
+//	map 分支只 Set 新键      → 上一行有、这一行没有的键**永久残留**
+//
+//	out := &Player{Id: 1}; db.FindOneByPK(out)   // alice: bag={sword:1}
+//	out.Id = 2;            db.FindOneByPK(out)   // bob 的 bag 是空的
+//	// → out.Bag 仍是 {sword:1}，**bob 拿到了 alice 的背包**
+//
+// list 分支原本靠 Truncate(0) 侥幸躲过第三条，但躲不过前两条。统一在函数入口 Clear，
+// 三条一起堵死；顺带保证 Unmarshal 失败时也不会留下上一行的残值。
 func parseContainer(reflection protoreflect.Message, fieldDesc protoreflect.FieldDescriptor, raw string) error {
+	reflection.Clear(fieldDesc)
 	if raw == "" {
 		return nil
 	}
@@ -324,7 +361,6 @@ func parseContainer(reflection protoreflect.Message, fieldDesc protoreflect.Fiel
 	}
 
 	dst := reflection.Mutable(fieldDesc).List()
-	dst.Truncate(0)
 	src := holder.Get(fieldDesc).List()
 	for i := 0; i < src.Len(); i++ {
 		dst.Append(src.Get(i))

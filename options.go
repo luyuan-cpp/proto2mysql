@@ -73,17 +73,18 @@ func TableOptionsFromDescriptor(md protoreflect.MessageDescriptor) []TableOption
 				opts = append(opts, WithTableName(s))
 			}
 		case optNumPrimaryKey:
-			if cols := splitOptionCSV(v.String()); len(cols) > 0 {
-				opts = append(opts, WithPrimaryKey(cols...))
-			}
+			// 保留空分量交给 validateTableOptions 拒绝。若这里把 "id,,port"
+			// 先压成 ["id", "port"]，descriptor 路径就会绕过代码级选项已有的
+			// fail-closed 校验，并悄悄改变调用方声明的联合主键。
+			opts = append(opts, WithPrimaryKey(splitOptionCSV(v.String())...))
 		case optNumAutoIncrementKey:
 			if s := strings.TrimSpace(v.String()); s != "" {
 				opts = append(opts, WithAutoIncrementKey(s))
 			}
 		case optNumIndex:
-			if idx := splitOptionIndexes(v.String()); len(idx) > 0 {
-				opts = append(opts, WithIndexes(idx...))
-			}
+			// 与 primary_key 一样保留空分量，让 schema validator 拒绝
+			// "id;;port"，不能静默改写成两个合法索引。
+			opts = append(opts, WithIndexes(splitOptionIndexes(v.String())...))
 		case optNumUniqueKey:
 			if s := strings.TrimSpace(v.String()); s != "" {
 				opts = append(opts, WithUniqueKey(s))
@@ -217,27 +218,23 @@ func rangeUnknownOptionFields(b protoreflect.RawFields, seen map[protoreflect.Fi
 	}
 }
 
-// splitOptionCSV 拆分逗号分隔的字段列表并去空白，忽略空项。
+// splitOptionCSV 拆分逗号分隔的字段列表并去掉每项首尾空白，但故意保留空项。
+// 空项属于无效 schema 声明，必须由 validateTableOptions 报错，不能在解析层静默吞掉。
 func splitOptionCSV(s string) []string {
 	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
 	}
-	return out
+	return parts
 }
 
 // splitOptionIndexes 拆分索引选项：分号分隔多个索引，每个索引保留内部逗号（联合索引）。
+// 空索引分量故意保留，交给 validateTableOptions fail-closed。
 // 例："last_login" → 1个索引；"player_id;zone_id,created_at" → 2个索引（第2个为联合索引）。
 func splitOptionIndexes(s string) []string {
 	parts := strings.Split(s, ";")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
 	}
-	return out
+	return parts
 }

@@ -42,7 +42,7 @@ func TestConcurrentSyncAllTables(t *testing.T) {
 	// ALTER 会夹一条 MODIFY ... AUTO_INCREMENT，而 TiDB 不支持给已存在的列加自增
 	// （Error 8200，见 fixes-2026-08 第 14 条）——那会把"并发"这件事整个盖住，
 	// 8 个副本全失败，但失败原因跟锁毫无关系。
-	if _, err := root.Exec("CREATE TABLE `" + table + "` (`player_id` bigint unsigned NOT NULL, PRIMARY KEY(`player_id`))"); err != nil {
+	if _, err := root.Exec("CREATE TABLE `" + table + "` (`player_id` bigint unsigned NOT NULL DEFAULT 0, PRIMARY KEY(`player_id`))"); err != nil {
 		t.Fatalf("建探针表: %v", err)
 	}
 	defer func() { _, _ = root.Exec("DROP TABLE IF EXISTS `" + table + "`") }()
@@ -190,7 +190,7 @@ func TestConcurrentSyncFailsWithoutLock(t *testing.T) {
 
 	const table = "concurrent_nolock_probe"
 	_, _ = root.Exec("DROP TABLE IF EXISTS `" + table + "`")
-	if _, err := root.Exec("CREATE TABLE `" + table + "` (`player_id` bigint unsigned NOT NULL, PRIMARY KEY(`player_id`))"); err != nil {
+	if _, err := root.Exec("CREATE TABLE `" + table + "` (`player_id` bigint unsigned NOT NULL DEFAULT 0, PRIMARY KEY(`player_id`))"); err != nil {
 		t.Fatalf("建探针表: %v", err)
 	}
 	defer func() { _, _ = root.Exec("DROP TABLE IF EXISTS `" + table + "`") }()

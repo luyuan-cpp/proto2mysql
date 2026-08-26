@@ -15,12 +15,13 @@ import (
 
 // fakeCache 内存缓存实现，可注入错误模拟Redis故障
 type fakeCache struct {
-	mu      sync.Mutex
-	data    map[string][]byte
-	getErr  error
-	setErr  error
-	delErr  error
-	deleted []string
+	mu        sync.Mutex
+	data      map[string][]byte
+	getErr    error
+	setErr    error
+	delErr    error
+	deleted   []string
+	delCtxErr error
 }
 
 func newFakeCache() *fakeCache {
@@ -49,9 +50,10 @@ func (f *fakeCache) Set(_ context.Context, key string, value []byte, _ time.Dura
 	return nil
 }
 
-func (f *fakeCache) Del(_ context.Context, keys ...string) error {
+func (f *fakeCache) Del(ctx context.Context, keys ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.delCtxErr = ctx.Err()
 	if f.delErr != nil {
 		return f.delErr
 	}
@@ -273,6 +275,39 @@ func TestCacheInvalidateDeferredInTx(t *testing.T) {
 	db.cacheDelKeys(txDB.pendingCacheDels...)
 	if _, ok := cache.data[key]; ok {
 		t.Error("提交后应删除缓存")
+	}
+}
+
+// TestCacheInvalidateDeferredAcrossWithContext 事务实例派生 WithContext 后仍必须把待删 key
+// 记到同一个事务状态；否则提交路径只看原 txDB，派生实例记录的失效会永久漏掉。
+func TestCacheInvalidateDeferredAcrossWithContext(t *testing.T) {
+	cache := newFakeCache()
+	db := newCacheTestDB(cache)
+	table := db.Tables[GetTableName(&testpb.GolangTest{})]
+	msg := &testpb.GolangTest{Id: 77}
+
+	txDB := &DB{Tables: db.Tables, cache: db.cache, cacheTTL: db.cacheTTL, tx: new(sql.Tx)}
+	txDB.txOwner = txDB
+	derived := txDB.WithContext(context.Background())
+	derived.invalidateMessages(table, msg)
+
+	key, _ := cacheKeyFor(table, msg)
+	if len(txDB.pendingCacheDels) != 1 || txDB.pendingCacheDels[0] != key {
+		t.Fatalf("WithContext 必须共享事务待删队列，root=%v derived=%v",
+			txDB.pendingCacheDels, derived.pendingCacheDels)
+	}
+}
+
+// TestCommittedWriteCacheCleanupSurvivesRequestCancellation 数据库写成功后，请求 ctx 可能
+// 已在返回路上取消；缓存失效仍要用独立、有限时长的 ctx 尝试一次，否则陈旧值留到 TTL。
+func TestCommittedWriteCacheCleanupSurvivesRequestCancellation(t *testing.T) {
+	cache := newFakeCache()
+	db := newCacheTestDB(cache)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	db.WithContext(ctx).cacheDelKeys("pb:test:1")
+	if cache.delCtxErr != nil {
+		t.Fatalf("提交后缓存清理不应继承请求取消，实际 ctx err=%v", cache.delCtxErr)
 	}
 }
 

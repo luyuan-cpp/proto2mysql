@@ -11,8 +11,18 @@ err := db.Save(player)              // 有则更新、无则插入
 err = db.BatchSave([]proto.Message{...})
 ```
 
-生成的是 `INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col), ...`，
-**只更新本进程认识的列**，别的列原样保留。
+`Save` 只按**完整主键**识别“有则更新”：先 `UPDATE ... WHERE <full PK>`，没有命中才
+`INSERT`；并发插入同一主键时安全重试。重试 UPDATE 仍返回 0 时，会用 `FOR UPDATE`
+current read 核对数据库当前行与目标的全部已知列；不会受 REPEATABLE READ 旧快照影响，
+也不会把分类查询前刚插入的“同主键、不同值”误报成成功。它只更新本进程认识的
+非主键列，别的列原样保留。
+
+如果 `INSERT` 撞到主键不同的备用唯一键行，返回可用 `errors.Is(err, ErrDuplicateKey)`
+判断的错误，且不会修改那一行。没有主键的表会返回 `ErrPrimaryKeyNotFound`。
+
+自增主键的新记录请用 `InsertReturningID`。`Save(&Account{Id:0, Email:"已存在"})` 不再把
+`Email` 当身份去更新别人，而会返回 `ErrDuplicateKey`；要按业务唯一键合并，请显式写
+带业务规则的 SQLBuilder upsert。
 
 ### `update` —— 只写已赋值的字段
 
@@ -55,7 +65,7 @@ err = db.IncrByPK(player, "gold", 100)
 | `GetReplaceSQLWithArgs` | `REPLACE INTO` = DELETE + INSERT，**语句里没提到的列回到默认值** | `db.Save()` |
 | `GetBatchReplaceSQLWithArgs` | 同上 | `db.BatchSave()` |
 
-`DB.Save` / `DB.BatchSave` 本身**已经改走 ODKU 了**，是安全的。
+`DB.Save` / `DB.BatchSave` 本身走主键精确的 UPDATE→INSERT，是安全的。
 `GetReplaceSQLWithArgs` 保留下来只是作为**显式逃生口**——
 确实需要"整行推倒重来、未提及的列一律归位"时才用。
 

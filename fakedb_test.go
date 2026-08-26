@@ -182,12 +182,66 @@ func rows(vals ...[]driver.Value) [][]driver.Value { return vals }
 func row(vals ...driver.Value) []driver.Value      { return vals }
 
 // colRow 造一行 information_schema.COLUMNS 的结果：(列名, 列类型, 列注释)
+// colRow 一行 information_schema.COLUMNS 快照。
+// 列序必须与 getTableColumnMeta 的 SELECT 一致：
+// COLUMN_NAME, COLUMN_TYPE, COLUMN_COMMENT, IS_NULLABLE, COLUMN_DEFAULT, EXTRA。
+// colRow 用于本仓库 GolangTest 的对齐快照：数值列是 NOT NULL DEFAULT 0，TEXT/BLOB
+// 可空，pb:1 的 id 是无默认值的 AUTO_INCREMENT。要造漂移用 colRowAttrsDefault。
 func colRow(name, colType string, fieldNum int) []driver.Value {
+	nullable := fakeColumnIsNullable(colType)
+	extra := ""
+	if name == "id" && fieldNum == 1 {
+		nullable = false
+		extra = "auto_increment"
+	}
+	return colRowAttrs(name, colType, fieldNum, nullable, extra)
+}
+
+// colRowAttrs 同 colRow，但能指定 IS_NULLABLE 与 EXTRA（"auto_increment" 等）。
+func colRowAttrs(name, colType string, fieldNum int, nullable bool, extra string) []driver.Value {
+	return colRowAttrsDefault(name, colType, fieldNum, nullable, extra, fakeColumnDefault(colType, extra))
+}
+
+// colRowAttrsDefault 还能显式指定 COLUMN_DEFAULT；nil 表示 information_schema 返回 SQL NULL。
+func colRowAttrsDefault(name, colType string, fieldNum int, nullable bool, extra string, defaultValue driver.Value) []driver.Value {
 	comment := ""
 	if fieldNum > 0 {
 		comment = fmt.Sprintf("pb:%d", fieldNum)
 	}
-	return row(name, colType, comment)
+	isNullable := "NO"
+	if nullable {
+		isNullable = "YES"
+	}
+	return row(name, colType, comment, isNullable, defaultValue, extra)
+}
+
+func fakeColumnIsNullable(colType string) bool {
+	upper := strings.ToUpper(colType)
+	return strings.Contains(upper, "TEXT") || strings.Contains(upper, "BLOB") || strings.Contains(upper, "DATETIME")
+}
+
+func fakeColumnDefault(colType, extra string) driver.Value {
+	if strings.Contains(strings.ToLower(extra), "auto_increment") {
+		return nil
+	}
+	base := strings.ToLower(strings.Fields(colType)[0])
+	if strings.HasPrefix(base, "tinyint") || strings.HasPrefix(base, "smallint") ||
+		strings.HasPrefix(base, "mediumint") || strings.HasPrefix(base, "int") ||
+		strings.HasPrefix(base, "bigint") || strings.HasPrefix(base, "float") ||
+		strings.HasPrefix(base, "double") {
+		return "0"
+	}
+	return nil
+}
+
+// indexRow 造一行 information_schema.STATISTICS 的结果，列序与 core 查询一致。
+// subPart 传 nil 表示整列索引；TEXT/BLOB 前缀索引传 int64(TextIndexPrefixLength)。
+func indexRow(name string, unique bool, sequence int, column string, subPart driver.Value) []driver.Value {
+	nonUnique := int64(1)
+	if unique {
+		nonUnique = 0
+	}
+	return row(name, nonUnique, int64(sequence), column, subPart)
 }
 
 // newFakeDB 建一个绑定假连接的 *DB，并注册 GolangTest。

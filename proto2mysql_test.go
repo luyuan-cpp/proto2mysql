@@ -200,7 +200,10 @@ func TestAlterTable(t *testing.T) {
 func TestCreateOrUpdateTableBackfillsMissingPrimaryKey(t *testing.T) {
 	pdb := NewDB()
 	testTable := &testpb.GolangTest{}
-	pdb.RegisterTable(testTable)
+	const tableName = "missing_pk_probe"
+	// 这条只测“补主键”，用独立表并关闭自增，避免把 signedness/auto_increment 漂移
+	// 混进同一用例，也不污染后续依赖 golang_test 的集成测试。
+	pdb.RegisterTable(testTable, WithTableName(tableName), WithAutoIncrementKey(""))
 
 	db := mustOpenTestDB(t, pdb)
 	defer closeTestDB(t, db)
@@ -215,14 +218,14 @@ func TestCreateOrUpdateTableBackfillsMissingPrimaryKey(t *testing.T) {
 		t.Skip("TiDB 不支持给已存在的列加 AUTO_INCREMENT（Error 8200）")
 	}
 
-	tableName := GetTableName(testTable)
 	escaped := escapeMySQLName(tableName)
 
 	// 从干净起点出发,建一张**故意不带主键**的同名表(模拟陈旧 DDL 建的表)。
 	if _, err := db.Exec("DROP TABLE IF EXISTS " + escaped); err != nil {
 		t.Fatalf("清理旧表失败: %v", err)
 	}
-	if _, err := db.Exec("CREATE TABLE " + escaped + " (id BIGINT NOT NULL DEFAULT 0)"); err != nil {
+	defer func() { _, _ = db.Exec("DROP TABLE IF EXISTS " + escaped) }()
+	if _, err := db.Exec("CREATE TABLE " + escaped + " (id INT UNSIGNED NOT NULL DEFAULT 0)"); err != nil {
 		t.Fatalf("建无主键表失败: %v", err)
 	}
 
@@ -1128,9 +1131,10 @@ func TestUpdateFieldType(t *testing.T) {
 		t.Errorf("初始字段类型错误，mediumtext，实际为: %s", initialType)
 	}
 
-	// 3. 修改字段类型映射并更新表结构
+	// 3. 修改字段类型映射并更新表结构。只做可安全自动执行的 MEDIUMTEXT → LONGTEXT
+	// 扩容；NULL/NOT NULL 漂移现在会返回 ErrSchemaDrift，不能再混进这个用例。
 	oldType := MySQLFieldTypes[protoreflect.StringKind]
-	MySQLFieldTypes[protoreflect.StringKind] = "MEDIUMTEXT NOT NULL"
+	MySQLFieldTypes[protoreflect.StringKind] = "LONGTEXT"
 	defer func() {
 		MySQLFieldTypes[protoreflect.StringKind] = oldType // 恢复原类型
 	}()
@@ -1147,8 +1151,8 @@ func TestUpdateFieldType(t *testing.T) {
 		t.Fatalf("更新后查询表结构失败: %v", err)
 	}
 	updatedType := updatedCols[testFieldName]
-	if !strings.Contains(updatedType, "mediumtext") {
-		t.Errorf("字段类型未更新，预期包含mediumtext，实际为: %s", updatedType)
+	if !strings.Contains(updatedType, "longtext") {
+		t.Errorf("字段类型未更新，预期包含longtext，实际为: %s", updatedType)
 	}
 }
 
@@ -2313,8 +2317,74 @@ func TestDescriptorTableOptions(t *testing.T) {
 	if got := splitOptionIndexes("player_id; zone_id,created_at"); len(got) != 2 || got[0] != "player_id" || got[1] != "zone_id,created_at" {
 		t.Errorf("索引拆分错误: %v", got)
 	}
+	if got := splitOptionIndexes("player_id;;zone_id"); len(got) != 3 || got[1] != "" {
+		t.Errorf("索引空分量必须保留给 schema validator 拒绝: %v", got)
+	}
 	if got := splitOptionCSV("user_id, provider"); len(got) != 2 || got[0] != "user_id" || got[1] != "provider" {
 		t.Errorf("CSV拆分错误: %v", got)
+	}
+	if got := splitOptionCSV("user_id,,provider"); len(got) != 3 || got[1] != "" {
+		t.Errorf("CSV 空分量必须保留给 schema validator 拒绝: %v", got)
+	}
+}
+
+func TestDescriptorPrimaryKeyEmptyComponentFailsClosed(t *testing.T) {
+	var raw []byte
+	raw = protowire.AppendTag(raw, optNumPrimaryKey, protowire.BytesType)
+	raw = protowire.AppendBytes(raw, []byte("id,,port"))
+	msgOpts := &descriptorpb.MessageOptions{}
+	msgOpts.ProtoReflect().SetUnknown(protoreflect.RawFields(raw))
+
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("invalid_descriptor_pk.proto"),
+		Package: proto.String("invaliddescriptorpk"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name:    proto.String("Probe"),
+			Options: msgOpts,
+			Field: []*descriptorpb.FieldDescriptorProto{
+				{Name: proto.String("id"), Number: proto.Int32(1), Type: descriptorpb.FieldDescriptorProto_TYPE_UINT64.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+				{Name: proto.String("port"), Number: proto.Int32(2), Type: descriptorpb.FieldDescriptorProto_TYPE_UINT32.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+			},
+		}},
+	}
+	fd, err := protodesc.NewFile(fdp, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatalf("构造 descriptor: %v", err)
+	}
+	msg := dynamicpb.NewMessage(fd.Messages().Get(0))
+	if err := ValidateTableMessage(msg); !errors.Is(err, ErrInvalidTableOption) {
+		t.Fatalf("descriptor 中 id,,port 必须在 DDL 前失败，实际: %v", err)
+	}
+}
+
+func TestDescriptorIndexEmptyComponentFailsClosed(t *testing.T) {
+	var raw []byte
+	raw = protowire.AppendTag(raw, optNumIndex, protowire.BytesType)
+	raw = protowire.AppendBytes(raw, []byte("id;;port"))
+	msgOpts := &descriptorpb.MessageOptions{}
+	msgOpts.ProtoReflect().SetUnknown(protoreflect.RawFields(raw))
+
+	fdp := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("invalid_descriptor_index.proto"),
+		Package: proto.String("invaliddescriptorindex"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name:    proto.String("Probe"),
+			Options: msgOpts,
+			Field: []*descriptorpb.FieldDescriptorProto{
+				{Name: proto.String("id"), Number: proto.Int32(1), Type: descriptorpb.FieldDescriptorProto_TYPE_UINT64.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+				{Name: proto.String("port"), Number: proto.Int32(2), Type: descriptorpb.FieldDescriptorProto_TYPE_UINT32.Enum(), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()},
+			},
+		}},
+	}
+	fd, err := protodesc.NewFile(fdp, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatalf("构造 descriptor: %v", err)
+	}
+	msg := dynamicpb.NewMessage(fd.Messages().Get(0))
+	if err := ValidateTableMessage(msg); !errors.Is(err, ErrInvalidTableOption) {
+		t.Fatalf("descriptor 中 id;;port 必须在 DDL 前失败，实际: %v", err)
 	}
 }
 
@@ -2603,7 +2673,7 @@ func TestSavePreservesUnknownColumns(t *testing.T) {
 		t.Errorf("Save 不得再用 REPLACE: %s", stmt.Sql)
 	}
 	// 零值也要写进去——Save 的语义是「整行落库」，不是「只写非零字段」
-	if !strings.Contains(stmt.Sql, "`port` = VALUES(`port`)") {
+	if !strings.Contains(stmt.Sql, "`port` = IF(`id` <=> VALUES(`id`), VALUES(`port`), `port`)") {
 		t.Errorf("ODKU 子句应覆盖全部已知列: %s", stmt.Sql)
 	}
 
@@ -2685,9 +2755,11 @@ func TestExpandOnlyGuard(t *testing.T) {
 		t.Errorf("期望仅一条 ADD COLUMN，实际 %v", clauses)
 	}
 
-	// 类型不兼容触发 MODIFY：拦下
+	// 同一文本族的安全拓宽（TEXT → MEDIUMTEXT）触发 MODIFY：ExpandOnly 仍应拦下。
+	// 跨族 int → MEDIUMTEXT 现在更早按 ErrUnsafeSchemaConversion fail-closed，不能再拿来
+	// 证明 ExpandOnly 自身覆盖了 MODIFY。
 	current = alignedCols(table, map[string]columnMeta{
-		"ip": {colType: "int", fieldNum: ipField.Number()},
+		"ip": {colType: "text", fieldNum: ipField.Number()},
 	}, "ip")
 	if _, err := table.buildAlterClauses(current, true); !errors.Is(err, ErrExpandOnlyViolation) {
 		t.Fatalf("ExpandOnly 应拦下 MODIFY，实际 err=%v", err)

@@ -54,12 +54,12 @@ func TestSQLBuilderInsertVariants(t *testing.T) {
 
 	stmt, err = b.InsertIgnore(msg)
 	checkStmt(t, stmt, err,
-		"INSERT IGNORE INTO `golang_test` ("+testAllCols+") VALUES (?, ?, ?, ?, ?, ?)",
+		"INSERT INTO `golang_test` ("+testAllCols+") VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE `id` = `id`",
 		[]interface{}{"7", "10.0.0.1", "8080", "0", "", "0"})
 
 	stmt, err = b.InsertIgnoreSetFields(msg)
 	checkStmt(t, stmt, err,
-		"INSERT IGNORE INTO `golang_test` (`id`, `ip`, `port`) VALUES (?, ?, ?)",
+		"INSERT INTO `golang_test` (`id`, `ip`, `port`) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `id` = `id`",
 		[]interface{}{"7", "10.0.0.1", "8080"})
 
 	// 自增主键未赋值时，列子集写法会整列省略，由 MySQL 发号
@@ -82,7 +82,7 @@ func TestSQLBuilderBatchInsert(t *testing.T) {
 
 	stmt, err := b.BatchInsertIgnore(msgs)
 	checkStmt(t, stmt, err,
-		"INSERT IGNORE INTO `golang_test` ("+testAllCols+") VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
+		"INSERT INTO `golang_test` ("+testAllCols+") VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE `id` = `id`",
 		[]interface{}{"1", "a", "0", "0", "", "0", "2", "b", "0", "0", "", "0"})
 
 	stmt, err = b.BatchUpsert(msgs, "ip")
@@ -148,10 +148,10 @@ func TestSQLBuilderSelect(t *testing.T) {
 	msg := &testpb.GolangTest{Id: 7}
 
 	stmt, err := b.SelectByPK(msg)
-	checkStmt(t, stmt, err, testSelectAll+" WHERE `id` = ?", []interface{}{"7"})
+	checkStmt(t, stmt, err, testSelectAll+" WHERE `id` = ?", []interface{}{uint64(7)})
 
 	stmt, err = b.SelectByPKForUpdate(msg)
-	checkStmt(t, stmt, err, testSelectAll+" WHERE `id` = ? FOR UPDATE", []interface{}{"7"})
+	checkStmt(t, stmt, err, testSelectAll+" WHERE `id` = ? FOR UPDATE", []interface{}{uint64(7)})
 
 	got := b.SelectWhere("`port` > ?", []interface{}{80}, QueryOptions{OrderBy: "`id` DESC", Limit: 20, Offset: 40})
 	checkStmt(t, got, nil,
@@ -186,7 +186,7 @@ func TestSQLBuilderSelect(t *testing.T) {
 
 	stmt, err = b.ExistsByPKForUpdate(msg)
 	checkStmt(t, stmt, err,
-		"SELECT 1 FROM `golang_test` WHERE `id` = ? LIMIT 1 FOR UPDATE", []interface{}{"7"})
+		"SELECT 1 FROM `golang_test` WHERE `id` = ? LIMIT 1 FOR UPDATE", []interface{}{uint64(7)})
 }
 
 func TestSQLBuilderUpdate(t *testing.T) {
@@ -196,35 +196,35 @@ func TestSQLBuilderUpdate(t *testing.T) {
 	stmt, err := b.UpdateByPK(msg)
 	checkStmt(t, stmt, err,
 		"UPDATE `golang_test` SET `id` = ?, `ip` = ?, `port` = ? WHERE `id` = ?",
-		[]interface{}{"7", "10.0.0.1", "8080", "7"})
+		[]interface{}{"7", "10.0.0.1", "8080", uint64(7)})
 
 	// CAS：状态符合预期才允许写；若新旧值可能相同，RowsAffected=0 不能单独证明守卫失败
 	stmt, err = b.UpdateByPKIf(msg, "`group_id` = ?", []interface{}{3})
 	checkStmt(t, stmt, err,
 		"UPDATE `golang_test` SET `id` = ?, `ip` = ?, `port` = ? WHERE `id` = ? AND `group_id` = ?",
-		[]interface{}{"7", "10.0.0.1", "8080", "7", 3})
+		[]interface{}{"7", "10.0.0.1", "8080", uint64(7), 3})
 
 	// 指定列：即使是 proto3 零值也照写（清零场景）
 	stmt, err = b.UpdateFieldsByPK(msg, "port", "group_id")
 	checkStmt(t, stmt, err,
 		"UPDATE `golang_test` SET `port` = ?, `group_id` = ? WHERE `id` = ?",
-		[]interface{}{"8080", "0", "7"})
+		[]interface{}{"8080", "0", uint64(7)})
 
 	stmt, err = b.UpdateAssignsByPK(msg, AddCol("port", 1), SetColExpr("ip", "CONCAT(`ip`, ?)", "-x"))
 	checkStmt(t, stmt, err,
 		"UPDATE `golang_test` SET `port` = `port` + ?, `ip` = CONCAT(`ip`, ?) WHERE `id` = ?",
-		[]interface{}{1, "-x", "7"})
+		[]interface{}{1, "-x", uint64(7)})
 
 	stmt, err = b.IncrByPK(msg, "port", 5)
 	checkStmt(t, stmt, err,
 		"UPDATE `golang_test` SET `port` = `port` + ? WHERE `id` = ?",
-		[]interface{}{int64(5), "7"})
+		[]interface{}{int64(5), uint64(7)})
 
 	// 扣减守卫：够才扣，不会扣成负数
 	stmt, err = b.DecrByPKIfEnough(msg, "port", 5)
 	checkStmt(t, stmt, err,
 		"UPDATE `golang_test` SET `port` = `port` - ? WHERE `id` = ? AND `port` >= ?",
-		[]interface{}{int64(5), "7", int64(5)})
+		[]interface{}{int64(5), uint64(7), int64(5)})
 
 	// 负数扣减会让守卫恒真、扣减变累加，必须拒绝
 	if _, err := b.DecrByPKIfEnough(msg, "port", -1); err == nil {
@@ -247,12 +247,12 @@ func TestSQLBuilderDelete(t *testing.T) {
 	msg := &testpb.GolangTest{Id: 7}
 
 	stmt, err := b.DeleteByPK(msg)
-	checkStmt(t, stmt, err, "DELETE FROM `golang_test` WHERE `id` = ?", []interface{}{"7"})
+	checkStmt(t, stmt, err, "DELETE FROM `golang_test` WHERE `id` = ?", []interface{}{uint64(7)})
 
 	stmt, err = b.DeleteByPKIf(msg, "`group_id` = ?", []interface{}{3})
 	checkStmt(t, stmt, err,
 		"DELETE FROM `golang_test` WHERE `id` = ? AND `group_id` = ?",
-		[]interface{}{"7", 3})
+		[]interface{}{uint64(7), 3})
 
 	stmt, err = b.DeleteWhere("`port` = ?", []interface{}{80})
 	checkStmt(t, stmt, err,
@@ -365,7 +365,7 @@ func TestSQLBuilderTableOptionOverride(t *testing.T) {
 	stmt, err := b.SelectByPK(&testpb.GolangTest{PlayerId: 42})
 	checkStmt(t, stmt, err,
 		"SELECT "+testAllCols+" FROM `shard_1` WHERE `player_id` = ?",
-		[]interface{}{"42"})
+		[]interface{}{uint64(42)})
 }
 
 // TestDBSQLBuilder DB 上的入口复用已注册表的配置，且不需要连库
@@ -378,7 +378,7 @@ func TestDBSQLBuilder(t *testing.T) {
 		t.Fatalf("获取SQLBuilder失败: %v", err)
 	}
 	stmt, err := b.SelectByPK(&testpb.GolangTest{Id: 1})
-	checkStmt(t, stmt, err, testSelectAll+" WHERE `id` = ?", []interface{}{"1"})
+	checkStmt(t, stmt, err, testSelectAll+" WHERE `id` = ?", []interface{}{uint64(1)})
 
 	if _, err := pdb.SQLBuilder(&testpb.GolangTest2{}); !errors.Is(err, ErrTableNotFound) {
 		t.Errorf("未注册表应返回ErrTableNotFound，实际: %v", err)

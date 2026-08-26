@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -69,7 +70,12 @@ func (p *DB) CacheKey(message proto.Message) (string, error) {
 	return cacheKeyFor(table, message)
 }
 
-// InvalidateCache 手动删除一批消息对应的缓存（按WHERE批量写后可调用）
+// InvalidateCache 手动删除一批消息对应的缓存（按WHERE批量写后可调用）。
+//
+// **事务内调用会延迟到提交成功之后**，与 invalidateMessages 同一套语义。原先这里
+// 无条件立即 Del：在 RunInTransaction 里先删缓存、事务再回滚的话，删掉的是一条
+// 本该继续有效的条目，下一次读会把**未回滚前的库值**重新灌回缓存——写路径特意
+// 做的"先写库后删缓存 + 回滚不删"在这条手动入口上整个被绕过。
 func (p *DB) InvalidateCache(messages ...proto.Message) error {
 	if !p.cacheEnabled() || len(messages) == 0 {
 		return nil
@@ -83,7 +89,12 @@ func (p *DB) InvalidateCache(messages ...proto.Message) error {
 		}
 		keys = append(keys, key)
 	}
-	return p.cache.Del(context.Background(), keys...)
+	if p.tx != nil {
+		owner := p.transactionCacheOwner()
+		owner.pendingCacheDels = append(owner.pendingCacheDels, keys...)
+		return nil
+	}
+	return p.cache.Del(p.context(), keys...)
 }
 
 func (p *DB) cacheEnabled() bool {
@@ -102,20 +113,59 @@ func (p *DB) cacheEnabled() bool {
 // 放进 value 头部则：key 不变 → 失效跨版本照常生效；读时做超集判定 →
 // 只有「认识更多字段的一方读到认识更少的一方写的条目」才 miss（单向），
 // 雪崩面小，而且是原地覆写，不会把旧 key 空间搁浅占内存。
+//
+// ⚠️ 复合主键的分量必须**转义分隔符**再拼，否则两个不同的主键会得到同一个 key：
+//
+//	("x:y", "z")  →  pb:t:x:y:z
+//	("x", "y:z")  →  pb:t:x:y:z     ← 同一个 key
+//
+// 命中时返回的是另一行的**整条 protobuf**，而且两边互相投毒——这是静默的跨行脏读，
+// 库里数据自始至终是对的，零日志零异常。字符串主键（订单号、外部账号 ID、
+// 复合业务键）里带冒号一点都不罕见。
+//
+// 表名与每个主键分量都使用最小侵入的百分号编码：只动 '%' 和 ':' 两个字符，其余原样。
+// 于是不含这两个字符的表名/主键（整数、绝大多数字符串）**产出的 key 与旧版逐字节相同**，
+// 升级不会让存量缓存整体失效；含分隔符的值必须让共用 Redis 的其它语言实现同步编码，
+// 只有原本就在碰撞的那些值才会换 key，而那正是我们要它们分开。注意这部分 key 在
+// 新旧进程混部时无法互相失效：涉及 '%' / ':' 的部署应在升级窗口禁用或 flush 缓存，
+// 并同步切换所有语言实现，不能依赖自然滚动维持缓存一致性。
 func cacheKeyFor(table *MessageTable, message proto.Message) (string, error) {
-	values, err := table.primaryKeyValues(message)
+	values, err := table.primaryKeySerializedValues(message)
 	if err != nil {
 		return "", err
 	}
 
 	var b strings.Builder
 	b.WriteString("pb:")
-	b.WriteString(table.tableName)
+	// 表名与主键分量共用 ':' 分隔符，必须同样编码；否则表 "a:1" 的
+	// 单主键 (2) 会与表 "a" 的复合主键 (1,2) 生成同一个 key。
+	b.WriteString(escapeCacheKeyPart(table.tableName))
 	for _, v := range values {
 		b.WriteString(":")
-		b.WriteString(fmt.Sprint(v))
+		b.WriteString(escapeCacheKeyPart(fmt.Sprint(v)))
 	}
 	return b.String(), nil
+}
+
+// escapeCacheKeyPart 把表名/主键分量里的分隔符转义掉：'%' → "%25"、':' → "%3A"。
+// 不含这两个字符时原样返回（连拷贝都不做），保证绝大多数 key 与旧版逐字节一致。
+func escapeCacheKeyPart(s string) string {
+	if !strings.ContainsAny(s, "%:") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '%':
+			b.WriteString("%25")
+		case ':':
+			b.WriteString("%3A")
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
 
 // ── 缓存条目的信封 ──────────────────────────────────────────────────────
@@ -145,10 +195,15 @@ func cacheKeyFor(table *MessageTable, message proto.Message) (string, error) {
 //
 // 老条目（裸 pb 字节，没有 magic）读到就当未命中——安全，且会被下一次写覆盖。
 const (
-	cacheEntryVersion = 1
+	cacheEntryVersion       = 1
+	maxCacheEntryFieldCount = 1 << 16
 )
 
 var cacheEntryMagic = []byte("P2MC")
+
+// CacheCleanupTimeout 是数据库写成功后的缓存失效预算。该清理不能继承已经取消的请求
+// context（否则写已提交、旧缓存却没删），也不能无限阻塞返回路径。
+const CacheCleanupTimeout = 2 * time.Second
 
 // encodeCacheEntry 把「写入方认识的字段号集合」和 pb 字节打包成一条缓存条目。
 func encodeCacheEntry(fieldNumbers map[int32]struct{}, payload []byte) []byte {
@@ -185,14 +240,27 @@ func decodeCacheEntry(data []byte) (fields map[int32]struct{}, payload []byte, o
 		return nil, nil, false
 	}
 	pos += n
+	// count 来自外部缓存，不能在验证前直接拿去做 make 的容量提示。
+	// 每个字段号至少占 1 字节，所以 count 大于剩余字节数一定是截断/恶意输入；
+	// 另设一个远高于 MySQL 单表字段上限的硬阈值，避免大条目把 map 放大到无界。
+	if count > maxCacheEntryFieldCount || count > uint64(len(data)-pos) {
+		return nil, nil, false
+	}
 
-	fields = make(map[int32]struct{}, count)
+	fields = make(map[int32]struct{}, int(count))
+	var previous uint64
 	for i := uint64(0); i < count; i++ {
 		num, n := binary.Uvarint(data[pos:])
 		if n <= 0 {
 			return nil, nil, false
 		}
 		pos += n
+		// protobuf 字段号从 1 开始且有明确上限。信封格式还规定字段号升序；
+		// 严格递增同时排除重复，避免 uint64 -> int32 截断或非规范集合绕过超集判定。
+		if num == 0 || num > uint64(protowire.MaxValidNumber) || (i > 0 && num <= previous) {
+			return nil, nil, false
+		}
+		previous = num
 		fields[int32(num)] = struct{}{}
 	}
 	return fields, data[pos:], true
@@ -217,7 +285,7 @@ func (p *DB) cacheGetProto(table *MessageTable, message proto.Message) bool {
 		return false
 	}
 
-	data, err := p.cache.Get(context.Background(), key)
+	data, err := p.cache.Get(p.context(), key)
 	if err != nil {
 		if !errors.Is(err, ErrCacheMiss) {
 			log.Printf("proto2mysql: cache get %s failed (fallback to db): %v", key, err)
@@ -266,7 +334,7 @@ func (p *DB) cacheSetProto(table *MessageTable, message proto.Message) {
 		return
 	}
 	data = encodeCacheEntry(table.fieldNumbers, data)
-	if err := p.cache.Set(context.Background(), key, data, p.cacheTTL); err != nil {
+	if err := p.cache.Set(p.context(), key, data, p.cacheTTL); err != nil {
 		log.Printf("proto2mysql: cache set %s failed: %v", key, err)
 	}
 }
@@ -276,7 +344,9 @@ func (p *DB) cacheDelKeys(keys ...string) {
 	if !p.cacheEnabled() || len(keys) == 0 {
 		return
 	}
-	if err := p.cache.Del(context.Background(), keys...); err != nil {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(p.context()), CacheCleanupTimeout)
+	defer cancel()
+	if err := p.cache.Del(ctx, keys...); err != nil {
 		log.Printf("proto2mysql: cache del %v failed (stale until ttl): %v", keys, err)
 	}
 }
@@ -301,7 +371,8 @@ func (p *DB) invalidateMessages(table *MessageTable, messages ...proto.Message) 
 	}
 
 	if p.tx != nil {
-		p.pendingCacheDels = append(p.pendingCacheDels, keys...)
+		owner := p.transactionCacheOwner()
+		owner.pendingCacheDels = append(owner.pendingCacheDels, keys...)
 		return
 	}
 	p.cacheDelKeys(keys...)

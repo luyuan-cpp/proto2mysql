@@ -78,7 +78,7 @@ func TestTiDBClusterSchemaVisibleOnOtherNode(t *testing.T) {
 	const table = "tidb_cluster_probe"
 	_, _ = db0.Exec("DROP TABLE IF EXISTS `" + table + "`")
 	if _, err := db0.Exec(
-		"CREATE TABLE `" + table + "` (`player_id` bigint unsigned NOT NULL, PRIMARY KEY(`player_id`))"); err != nil {
+		"CREATE TABLE `" + table + "` (`player_id` bigint unsigned NOT NULL DEFAULT 0, PRIMARY KEY(`player_id`))"); err != nil {
 		t.Fatalf("建探针表: %v", err)
 	}
 	defer func() { _, _ = db0.Exec("DROP TABLE IF EXISTS `" + table + "`") }()
@@ -133,7 +133,7 @@ func TestTiDBClusterConcurrentSyncAcrossNodes(t *testing.T) {
 	const table = "tidb_cluster_concurrent_probe"
 	_, _ = root.Exec("DROP TABLE IF EXISTS `" + table + "`")
 	if _, err := root.Exec(
-		"CREATE TABLE `" + table + "` (`player_id` bigint unsigned NOT NULL, PRIMARY KEY(`player_id`))"); err != nil {
+		"CREATE TABLE `" + table + "` (`player_id` bigint unsigned NOT NULL DEFAULT 0, PRIMARY KEY(`player_id`))"); err != nil {
 		t.Fatalf("建探针表: %v", err)
 	}
 	defer func() { _, _ = root.Exec("DROP TABLE IF EXISTS `" + table + "`") }()

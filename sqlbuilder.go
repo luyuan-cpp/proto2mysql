@@ -95,6 +95,12 @@ type Assign struct {
 	col  string        // 原始列名，构建时用于校验该列存在于消息
 	expr string        // 完整赋值表达式，列名已转义，如 "`gold` = `gold` + ?"
 	args []interface{} // expr 里 ? 对应的参数，按出现顺序
+	// numeric 这条赋值是算术表达式（+ / - / LEAST / GREATEST），列必须是数值列。
+	//
+	// MySQL 对非数值列做算术**不报错**：先把内容按数值解析（解析不出算 0）再写回，
+	// 于是 MEDIUMTEXT 列上的 `nickname` = `nickname` + 1 会把 "abc" 静默变成 "1"。
+	// 光校验"列存在"挡不住这个——写错的列名只要碰巧存在就一路放行到库里。
+	numeric bool
 }
 
 // SetCol 设为给定值：col = ?
@@ -106,13 +112,13 @@ func SetCol(col string, val interface{}) Assign {
 // AddCol 原地累加：col = col + ?（货币/经验/计数器，避免读-改-写竞态）
 func AddCol(col string, delta interface{}) Assign {
 	e := escapeMySQLName(col)
-	return Assign{col: col, expr: e + " = " + e + " + ?", args: []interface{}{delta}}
+	return Assign{col: col, numeric: true, expr: e + " = " + e + " + ?", args: []interface{}{delta}}
 }
 
 // SubCol 原地扣减：col = col - ?（是否允许扣成负数由 WHERE 守卫决定，见 UpdateAssignsWhere）
 func SubCol(col string, delta interface{}) Assign {
 	e := escapeMySQLName(col)
-	return Assign{col: col, expr: e + " = " + e + " - ?", args: []interface{}{delta}}
+	return Assign{col: col, numeric: true, expr: e + " = " + e + " - ?", args: []interface{}{delta}}
 }
 
 // SetColExpr 自定义赋值表达式：col = <expr>，expr 里的 ? 由 args 依次填充。
@@ -136,26 +142,26 @@ func SetNew(col string) Assign {
 // AddNew 冲突时累加新值：col = col + VALUES(col)（发奖/加币的原子累加写法）
 func AddNew(col string) Assign {
 	e := escapeMySQLName(col)
-	return Assign{col: col, expr: e + " = " + e + " + VALUES(" + e + ")"}
+	return Assign{col: col, numeric: true, expr: e + " = " + e + " + VALUES(" + e + ")"}
 }
 
 // MinNew 冲突时取较小值：col = LEAST(col, VALUES(col))（重试退避时间取更早的一次）
 func MinNew(col string) Assign {
 	e := escapeMySQLName(col)
-	return Assign{col: col, expr: e + " = LEAST(" + e + ", VALUES(" + e + "))"}
+	return Assign{col: col, numeric: true, expr: e + " = LEAST(" + e + ", VALUES(" + e + "))"}
 }
 
 // MaxNew 冲突时取较大值：col = GREATEST(col, VALUES(col))（水位/序号只增不减）
 func MaxNew(col string) Assign {
 	e := escapeMySQLName(col)
-	return Assign{col: col, expr: e + " = GREATEST(" + e + ", VALUES(" + e + "))"}
+	return Assign{col: col, numeric: true, expr: e + " = GREATEST(" + e + ", VALUES(" + e + "))"}
 }
 
 // SetNewIfZero 首写生效：col = IF(col = 0, VALUES(col), col)
 // 已经写过（非 0）就保持不动，用于“第一次落的时间戳/终态不可被覆盖”。
 func SetNewIfZero(col string) Assign {
 	e := escapeMySQLName(col)
-	return Assign{col: col, expr: e + " = IF(" + e + " = 0, VALUES(" + e + "), " + e + ")"}
+	return Assign{col: col, numeric: true, expr: e + " = IF(" + e + " = 0, VALUES(" + e + "), " + e + ")"}
 }
 
 // KeepOld 保持原值不变：col = col。
@@ -174,6 +180,19 @@ func (b *SQLBuilder) buildAssigns(assigns []Assign) (string, []interface{}, erro
 	clauses := make([]string, 0, len(assigns))
 	args := make([]interface{}, 0, len(assigns))
 	for _, a := range assigns {
+		// 数值赋值（AddCol / SubCol / AddNew / MinNew / MaxNew / SetNewIfZero）
+		// 要额外查列是不是数值列。
+		// 只查"列存在"挡不住 IncrByPK(m, "nickname", 1) 这种写错列名的调用——
+		// MySQL 会把 MEDIUMTEXT 的 "abc" + 1 静默算成 1 再写回去。
+		// UpsertAdd 早就在做同样的把关，这里补上其余入口。
+		if a.numeric {
+			if err := b.table.requireNumericColumn(a.col); err != nil {
+				return "", nil, err
+			}
+			clauses = append(clauses, a.expr)
+			args = append(args, a.args...)
+			continue
+		}
 		if err := b.checkColumn(a.col); err != nil {
 			return "", nil, err
 		}
@@ -215,24 +234,24 @@ func (b *SQLBuilder) InsertSetFields(m proto.Message) (*SqlWithArgs, error) {
 	return &SqlWithArgs{Sql: stmt, Args: args}, nil
 }
 
-// InsertIgnore 幂等插入：INSERT IGNORE INTO ...，主键/唯一键冲突时跳过。
-// 注意 IGNORE 会把一部分真实错误（类型截断等）降级成 warning，只在“重复即跳过”确实是
-// 预期行为时使用；只想拿行锁不改数据用 UpsertKeepOld。
+// InsertIgnore 幂等插入：唯一键冲突时执行明确的 no-op ODKU。
+// 不使用 INSERT IGNORE：IGNORE 还会把类型截断、越界、NOT NULL 等真实错误降级成
+// warning 并写入被 MySQL 修正过的值，远超“重复即跳过”的契约。
 func (b *SQLBuilder) InsertIgnore(m proto.Message) (*SqlWithArgs, error) {
 	stmt, err := b.table.GetInsertSQLWithArgs(m)
 	if err != nil {
 		return nil, err
 	}
-	return &SqlWithArgs{Sql: toInsertIgnore(stmt.Sql), Args: stmt.Args}, nil
+	return b.withDuplicateNoop(stmt), nil
 }
 
-// InsertIgnoreSetFields 列子集版的 INSERT IGNORE（列选取规则同 InsertSetFields）
+// InsertIgnoreSetFields 列子集版（列选取规则同 InsertSetFields）。
 func (b *SQLBuilder) InsertIgnoreSetFields(m proto.Message) (*SqlWithArgs, error) {
 	stmt, err := b.InsertSetFields(m)
 	if err != nil {
 		return nil, err
 	}
-	return &SqlWithArgs{Sql: toInsertIgnore(stmt.Sql), Args: stmt.Args}, nil
+	return b.withDuplicateNoop(stmt), nil
 }
 
 // Replace 整行替换：REPLACE INTO ...（冲突时先删后插，会丢掉未提供的列并触发外键级联，慎用）
@@ -251,7 +270,7 @@ func (b *SQLBuilder) BatchInsertIgnore(msgs []proto.Message) (*SqlWithArgs, erro
 	if err != nil {
 		return nil, err
 	}
-	return &SqlWithArgs{Sql: toInsertIgnore(stmt.Sql), Args: stmt.Args}, nil
+	return b.withDuplicateNoop(stmt), nil
 }
 
 // BatchReplace 批量整行替换
@@ -423,9 +442,24 @@ func (b *SQLBuilder) setFieldColumns(m proto.Message) ([]string, []interface{}, 
 	return cols, args, nil
 }
 
-// toInsertIgnore 把 INSERT 前缀换成 INSERT IGNORE
-func toInsertIgnore(stmt string) string {
-	return "INSERT IGNORE" + strings.TrimPrefix(stmt, "INSERT")
+// withDuplicateNoop 只吞唯一键冲突，其他 INSERT 错误保持错误。
+func (b *SQLBuilder) withDuplicateNoop(stmt *SqlWithArgs) *SqlWithArgs {
+	column := ""
+	for _, pk := range b.table.primaryKey {
+		pk = strings.TrimSpace(pk)
+		if _, ok := b.table.fieldNameToDesc[pk]; ok {
+			column = pk
+			break
+		}
+	}
+	if column == "" && b.table.Descriptor.Fields().Len() > 0 {
+		column = string(b.table.Descriptor.Fields().Get(0).Name())
+	}
+	escaped := escapeMySQLName(column)
+	return &SqlWithArgs{
+		Sql:  stmt.Sql + " ON DUPLICATE KEY UPDATE " + escaped + " = " + escaped,
+		Args: stmt.Args,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +517,10 @@ func (b *SQLBuilder) SelectColumns(cols []string, whereClause string, args []int
 // SelectByKVIn 按某列的取值集合批量查：... WHERE col IN (?, ?, ...)（占位符按 vals 长度展开）
 func (b *SQLBuilder) SelectByKVIn(col string, vals []interface{}, opts QueryOptions) (*SqlWithArgs, error) {
 	where, err := b.inClause(col, len(vals))
+	if err != nil {
+		return nil, err
+	}
+	vals, err = b.table.normalizeColumnComparisonValues(col, vals)
 	if err != nil {
 		return nil, err
 	}
@@ -631,7 +669,8 @@ func (b *SQLBuilder) DecrByPKIfEnough(m proto.Message, col string, delta int64) 
 	if delta <= 0 {
 		return nil, fmt.Errorf("delta must be positive, got %d", delta)
 	}
-	if err := b.checkColumn(col); err != nil {
+	// 这里的守卫条件 `col >= ?` 也要求数值列，与下面的 SubCol 同一条规则。
+	if err := b.table.requireNumericColumn(col); err != nil {
 		return nil, err
 	}
 	where, whereArgs, err := b.table.primaryKeyWhere(m)
@@ -707,6 +746,10 @@ func (b *SQLBuilder) DeleteWhereLimit(whereClause string, args []interface{}, or
 // DeleteByKVIn 按某列的取值集合批删：DELETE FROM t WHERE col IN (?, ?, ...)
 func (b *SQLBuilder) DeleteByKVIn(col string, vals []interface{}) (*SqlWithArgs, error) {
 	where, err := b.inClause(col, len(vals))
+	if err != nil {
+		return nil, err
+	}
+	vals, err = b.table.normalizeColumnComparisonValues(col, vals)
 	if err != nil {
 		return nil, err
 	}

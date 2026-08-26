@@ -189,7 +189,8 @@ if err := pbDB.SyncAllTables(); err != nil {
 `UpdateTableField` / `SyncAllTables` / `GenerateMigrationSQL` 同步结构时，会先扫描线上表
 （读取 `information_schema` 的列类型与注释），并按如下优先级对齐：
 
-1. **列名相同**：类型不兼容时 `MODIFY COLUMN` 对齐类型（并回填字段号注释）；
+1. **列名相同**：仅对安全扩容执行 `MODIFY COLUMN`（并回填字段号注释）；signed/unsigned、
+   NULL、DEFAULT、AUTO_INCREMENT 等不安全漂移返回 `ErrUnsafeSchemaConversion` / `ErrSchemaDrift`；
 2. **列名不同但字段号相同**（即 proto 里把该字段改了名字）：用
    `CHANGE COLUMN 旧列名 新列名 新类型 COMMENT 'pb:N'` 改名并对齐类型，**原有数据保留**；
 3. **找不到对应列**：`ADD COLUMN` 新增。
@@ -204,8 +205,10 @@ if err := pbDB.SyncAllTables(); err != nil {
 #### 插入
 - `Insert(message proto.Message) error`: 插入单条记录
 - `BatchInsert(messages []proto.Message) error`: 批量插入记录
-- `InsertOnDupUpdate(message proto.Message) error`: 插入或更新（主键冲突时）
-- `Save(message proto.Message) error`: 替换记录（基于 REPLACE 语句）
+- `InsertOnDupUpdate(message proto.Message) error`: 历史 upsert 名称，现与 `Save` 使用相同的完整主键精确语义
+- `InsertIgnore(message proto.Message) (bool, error)`: 普通 INSERT；仅把 1062 唯一键冲突解释为“未插入”，其它数据错误照常返回
+- `Save(message proto.Message) error`: 按完整主键整行保存；存在则更新，不存在则插入，备用唯一键冲突返回 `ErrDuplicateKey`
+- `BatchSave(messages []proto.Message) error`: `Save` 的逐行批量版（事务外非原子）
 
 #### 查询
 - `FindOneByKV(message proto.Message, whereKey string, whereVal string) error`: 按键值对查询单条记录
@@ -244,9 +247,9 @@ if _, err := tx.ExecContext(ctx, stmt.Sql, stmt.Args...); err != nil { ... }
 |------|------|------|
 | INSERT | `Insert` | 全字段插入 |
 | | `InsertSetFields` | 只插已赋值字段，其余交给列默认值（自增 id / `DEFAULT CURRENT_TIMESTAMP`） |
-| | `InsertIgnore` / `InsertIgnoreSetFields` | `INSERT IGNORE`，冲突跳过 |
+| | `InsertIgnore` / `InsertIgnoreSetFields` | no-op ODKU，只跳过唯一键冲突，不吞类型截断等真实错误 |
 | | `Replace` | `REPLACE INTO`（先删后插） |
-| | `BatchInsert` / `BatchInsertIgnore` / `BatchReplace` | 多行 VALUES |
+| | `BatchInsert` / `BatchInsertIgnore` / `BatchReplace` | 多行 VALUES（Ignore 版同样只跳过唯一键冲突） |
 | UPSERT | `Upsert(m, cols...)` | `ON DUPLICATE KEY UPDATE c = VALUES(c)`，覆盖 |
 | | `UpsertAdd(m, cols...)` | `c = c + VALUES(c)`，累加计数器 |
 | | `UpsertKeepOld(m)` | `pk = pk`，插入或只加行锁不改数据 |
@@ -406,7 +409,9 @@ SELECT TO_BASE64(`player`) FROM `golang_test` WHERE `id` = 1;
 
 通过 `TableOption` 函数可以配置表的各种属性：
 
-- `WithPrimaryKey(keys ...string)`: 设置主键字段
+- `WithPrimaryKey(keys ...string)`: 设置主键字段；仅接受具有稳定等值身份语义、可完整索引且为
+  `NOT NULL` 的字段。当前 string/bytes 映射只能做前缀索引，会被拒绝；float/double 的
+  十进制、二进制与数据库比较语义不适合作为稳定身份，也会在 DDL 前被拒绝
 - `WithIndexes(indexes ...string)`: 设置普通索引
 - `WithUniqueKey(uniqueKey string)`: 设置唯一键
 - `WithAutoIncrementKey(key string)`: 设置自增字段

@@ -464,3 +464,47 @@ func TestTimestampNullClearsExistingValue(t *testing.T) {
 		t.Fatal("SQL NULL 应清除复用消息中已有的 Timestamp")
 	}
 }
+
+// TestNullColumnsDoNotLeakAcrossRows 列值为 NULL/空时必须把字段重置成默认值，
+// 否则复用同一个 message 连读两行会**串位**。
+//
+// 原先 setScalarDefault 只处理 8 种标量，**刻意跳过 bytes / enum / message**
+// （注释写的是"与旧行为一致"）。于是：
+//
+//	out := &GolangTest{Id: 1}; db.FindOneByPK(out)   // alice: Player 有值
+//	out.Id = 2;                db.FindOneByPK(out)   // bob 这列是 NULL
+//	// → out.Player 还是 alice 的，**bob 拿到了 alice 的数据**
+//
+// 而 FindOneByPK(out) 的 out 既是入参（主键）又是出参，复用同一个 message 正是
+// 这个 API 的天然用法，所以这不是"误用"。Python 侧 _set_scalar_default 同构。
+func TestNullColumnsDoNotLeakAcrossRows(t *testing.T) {
+	sub := &testpb.Player{PlayerId: 7, Name: "alice-sub"}
+	subBytes, err := proto.Marshal(sub)
+	if err != nil {
+		t.Fatalf("marshal sub: %v", err)
+	}
+
+	out := &testpb.GolangTest{}
+
+	// 第一行：message 列有值
+	if err := ParseFromString(out, []string{"1", "alice", "80", "3", string(subBytes), "42"}); err != nil {
+		t.Fatalf("第一行解析失败: %v", err)
+	}
+	if out.Player.GetName() != "alice-sub" {
+		t.Fatalf("第一行 Player 未填充: %v", out.Player)
+	}
+
+	// 第二行：ip 与 player 两列都是空（NULL 落到这里是空串）
+	if err := ParseFromString(out, []string{"2", "", "0", "0", "", "0"}); err != nil {
+		t.Fatalf("第二行解析失败: %v", err)
+	}
+	if out.Id != 2 {
+		t.Errorf("主键应更新为 2，实际 %d", out.Id)
+	}
+	if out.Ip != "" {
+		t.Errorf("string 列为空时必须清空，实际 %q", out.Ip)
+	}
+	if out.Player.GetName() != "" {
+		t.Errorf("message 列为 NULL 必须 Clear，否则串到下一行；实际 %v", out.Player)
+	}
+}

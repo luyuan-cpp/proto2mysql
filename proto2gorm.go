@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/luyuancpp/proto2mysql/pbconv"
 	"google.golang.org/protobuf/proto"
@@ -16,6 +17,8 @@ type GormDB struct {
 	Tables map[string]*MessageTable
 	DB     *gorm.DB
 	DBName string
+	// expandOnly 只允许「纯新增」的结构变更，语义与 DB.ExpandOnly 一致。用 SetExpandOnly 打开。
+	expandOnly bool
 }
 
 func NewGormDB(db *gorm.DB, dbname string) *GormDB {
@@ -28,9 +31,10 @@ func NewGormDB(db *gorm.DB, dbname string) *GormDB {
 
 func (p *GormDB) WithDB(db *gorm.DB) *GormDB {
 	return &GormDB{
-		Tables: p.Tables,
-		DB:     db,
-		DBName: p.DBName,
+		Tables:     p.Tables,
+		DB:         db,
+		DBName:     p.DBName,
+		expandOnly: p.expandOnly,
 	}
 }
 
@@ -41,12 +45,101 @@ func (p *GormDB) RegisterTable(m proto.Message, opts ...TableOption) {
 	p.Tables[GetTableName(m)] = table
 }
 
+// ExpandOnly 只允许「纯新增」的结构变更，语义与 DB.ExpandOnly 完全一致。
+// 见 DB 结构体上那段注释。
+func (p *GormDB) SetExpandOnly(enabled bool) { p.expandOnly = enabled }
+
+// CreateOrUpdateTable 建表并把线上结构对齐到当前 proto。
+//
+// ⚠️ 早先这个方法**只执行 CREATE TABLE IF NOT EXISTS，整个 GormDB 没有任何 ALTER 路径**。
+// 在一张已经存在的表上，它是无条件、每次、永久的 no-op——注意这不是 DB.syncTableSchema
+// 那种"并发下才触发"的竞态，而是百分之百不生效：proto 里加了字段，进程照常启动、
+// 零日志零错误，一直到第一条 SELECT 才报 Error 1054 Unknown column，而且重启也不会好。
+// 用 GormDB 的人以为自己有自动建表能力，实际上只有"第一次建表"能力。
+//
+// 现在与 DB.syncTableSchema 走同一套逻辑：建表（IF NOT EXISTS 可能是 no-op，所以
+// 建完继续往下）→ 读 information_schema → buildAlterClauses → 一条 ALTER 落地。
 func (p *GormDB) CreateOrUpdateTable(m proto.Message) error {
 	table, err := p.tableForMessage(m)
 	if err != nil {
 		return err
 	}
-	return p.DB.Exec(table.GetCreateTableSQL()).Error
+	registryKey := GetTableName(m)
+
+	exists, err := p.isTableExists(table.tableName)
+	if err != nil {
+		return fmt.Errorf("检查表 %s 存在性: %w", table.tableName, err)
+	}
+	if !exists {
+		if err := p.DB.Exec(table.GetCreateTableSQL()).Error; err != nil {
+			return fmt.Errorf("创建表 %s 失败: %w", table.tableName, err)
+		}
+		// 刻意不 return：CREATE TABLE IF NOT EXISTS 在并发下可能整条是 no-op，
+		// 理由与 DB.syncTableSchema 里那段完全一致。
+	}
+
+	currentCols, err := p.getTableColumnMeta(registryKey)
+	if err != nil {
+		return fmt.Errorf("获取表 %s 字段: %w", registryKey, err)
+	}
+	alterSQLs, err := table.buildAlterClauses(currentCols, p.expandOnly)
+	if err != nil {
+		return err
+	}
+	if len(alterSQLs) == 0 {
+		return nil
+	}
+
+	alterSQL := fmt.Sprintf("ALTER TABLE %s %s",
+		escapeMySQLName(table.tableName), strings.Join(alterSQLs, ", "))
+	if err := p.DB.Exec(alterSQL).Error; err != nil {
+		return fmt.Errorf("更新表 %s 结构失败: %w, SQL: %s", table.tableName, err, alterSQL)
+	}
+	table.clearColumnCache()
+	return nil
+}
+
+// isTableExists 查 information_schema 判断表是否存在。
+func (p *GormDB) isTableExists(tableName string) (bool, error) {
+	var count int64
+	err := p.DB.Raw(
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+		p.DBName, tableName,
+	).Scan(&count).Error
+	return count > 0, err
+}
+
+// getTableColumnMeta 读线上每列的类型 + 从注释解析出的 proto 字段号。
+// **刻意不走列类型缓存**：迁移不频繁，且这里要的是注释信息，混用会读到只有类型的旧缓存。
+func (p *GormDB) getTableColumnMeta(registryKey string) (map[string]columnMeta, error) {
+	table, ok := p.Tables[registryKey]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrTableNotFound, registryKey)
+	}
+
+	var rows []struct {
+		ColumnName    string
+		ColumnType    string
+		ColumnComment string
+	}
+	err := p.DB.Raw(
+		"SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_COMMENT FROM INFORMATION_SCHEMA.COLUMNS "+
+			"WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+		p.DBName, table.tableName,
+	).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	metas := make(map[string]columnMeta, len(rows))
+	for _, r := range rows {
+		num, ok := parseFieldNumFromComment(r.ColumnComment)
+		if !ok {
+			num = 0
+		}
+		metas[r.ColumnName] = columnMeta{colType: r.ColumnType, fieldNum: num}
+	}
+	return metas, nil
 }
 
 func (p *GormDB) GetCreateTableSQL(message proto.Message) string {

@@ -35,8 +35,14 @@ func TestGenerate(t *testing.T) {
 		"`id` bigint unsigned NOT NULL AUTO_INCREMENT",
 		"`email` MEDIUMTEXT",
 		"PRIMARY KEY (`id`)",
-		"INDEX `idx_account_0` (`name`)",
-		"UNIQUE KEY `uk_account` (`email`)",
+		// name / email 是 string → MEDIUMTEXT。MySQL 不允许对 TEXT/BLOB 列建
+		// 不带前缀长度的索引（Error 1170），所以这里必须带 (191)。
+		//
+		// 早先这两条断言写的是裸列名——也就是说这个测试一直在**断言一条 MySQL
+		// 根本不会执行的 DDL**。之所以长期没暴露，正是因为它只比对字符串、
+		// 从不真的把语句打到库上。
+		"INDEX `idx_account_0` (`name`(191))",
+		"UNIQUE KEY `uk_account` (`email`(191))",
 	}
 	for _, c := range checks {
 		if !strings.Contains(sql, c) {

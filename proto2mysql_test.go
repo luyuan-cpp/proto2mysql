@@ -1475,11 +1475,38 @@ func TestMySQLIdentifierEscaping(t *testing.T) {
 	for _, want := range []string{
 		"CREATE TABLE IF NOT EXISTS `" + tableName + "`",
 		"INDEX `idx_" + tableName + "_0` (`player_id`,`group_id`)",
-		"UNIQUE KEY `uk_" + tableName + "` (`ip`)",
+		// ip 是 string → MEDIUMTEXT。MySQL 不允许对 TEXT/BLOB 列建不带前缀长度的索引
+		// （Error 1170），所以这里必须带 (191)。早先不补前缀，产出的是一条 MySQL
+		// 会直接拒绝执行的 DDL——之所以长期没暴露，是因为测试只比对字符串、从不真的执行。
+		fmt.Sprintf("UNIQUE KEY `uk_%s` (`ip`(%d))", tableName, TextIndexPrefixLength),
 	} {
 		if !strings.Contains(createSQL, want) {
 			t.Fatalf("建表SQL缺少 %q\nSQL: %s", want, createSQL)
 		}
+	}
+}
+
+// TestTextIndexNeedsPrefixLength TEXT/BLOB 列上的索引必须带前缀长度，
+// 否则建表语句会被 MySQL 以 Error 1170 拒绝。
+func TestTextIndexNeedsPrefixLength(t *testing.T) {
+	pdb := NewDB()
+	msg := &testpb.GolangTest{}
+	pdb.RegisterTable(msg, WithIndexes("ip"), WithUniqueKey("ip"))
+	createSQL := pdb.GetCreateTableSQL(msg)
+
+	if strings.Contains(createSQL, "(`ip`)") {
+		t.Errorf("TEXT 列索引不能是裸列名（MySQL Error 1170）: %s", createSQL)
+	}
+	want := fmt.Sprintf("`ip`(%d)", TextIndexPrefixLength)
+	if strings.Count(createSQL, want) != 2 { // 普通索引 + 唯一键各一次
+		t.Errorf("普通索引与唯一键都应带前缀 %q: %s", want, createSQL)
+	}
+
+	// 非 TEXT 列不补前缀
+	pdb2 := NewDB()
+	pdb2.RegisterTable(msg, WithIndexes("player_id"))
+	if sql2 := pdb2.GetCreateTableSQL(msg); !strings.Contains(sql2, "(`player_id`)") {
+		t.Errorf("非 TEXT 列不应补前缀: %s", sql2)
 	}
 }
 
@@ -2478,23 +2505,175 @@ func TestBuildAlterClausesUsesFieldNumbers(t *testing.T) {
 	ipField := table.Descriptor.Fields().ByName("ip")
 	ipType := table.getMySQLFieldType(ipField)
 
-	clauses := table.buildAlterClauses(map[string]columnMeta{
+	clauses, err := table.buildAlterClauses(map[string]columnMeta{
 		"old_ip": {colType: ipType, fieldNum: ipField.Number()},
-	})
+	}, false)
+	if err != nil {
+		t.Fatalf("buildAlterClauses: %v", err)
+	}
 	joined := strings.Join(clauses, "\n")
 	wantRename := fmt.Sprintf("CHANGE COLUMN `old_ip` `ip` %s COMMENT 'pb:%d'", ipType, ipField.Number())
 	if !strings.Contains(joined, wantRename) {
 		t.Fatalf("missing field-number rename clause %q in:\n%s", wantRename, joined)
 	}
 
-	clauses = table.buildAlterClauses(map[string]columnMeta{
+	clauses, err = table.buildAlterClauses(map[string]columnMeta{
 		"ip": {colType: ipType},
-	})
+	}, false)
+	if err != nil {
+		t.Fatalf("buildAlterClauses: %v", err)
+	}
 	joined = strings.Join(clauses, "\n")
 	wantBackfill := fmt.Sprintf("MODIFY COLUMN `ip` %s COMMENT 'pb:%d'", ipType, ipField.Number())
 	if !strings.Contains(joined, wantBackfill) {
 		t.Fatalf("missing legacy metadata backfill clause %q in:\n%s", wantBackfill, joined)
 	}
+}
+
+// TestSavePreservesUnknownColumns Save 必须走 ODKU，不能走 REPLACE INTO。
+//
+// REPLACE 是 DELETE+INSERT，语句里没提到的列会**回到默认值**；而列清单来自本进程的
+// descriptor，所以滚动发布时旧版本 Save 一次，新版本刚写进去的列就没了，且零报错。
+// ODKU 只动子句里点名的列，别的原样保留。
+//
+// （改动前这条路径在两个仓库里都是零测试覆盖。）
+func TestSavePreservesUnknownColumns(t *testing.T) {
+	table := newMessageTable(&testpb.GolangTest{}, WithPrimaryKey("id"))
+
+	stmt, err := table.GetSaveSQLWithArgs(&testpb.GolangTest{Id: 7, Ip: "a"})
+	if err != nil {
+		t.Fatalf("GetSaveSQLWithArgs: %v", err)
+	}
+	if !strings.HasPrefix(stmt.Sql, "INSERT INTO `golang_test`") {
+		t.Errorf("Save 应以 INSERT 开头: %s", stmt.Sql)
+	}
+	if !strings.Contains(stmt.Sql, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("Save 必须用 ODKU: %s", stmt.Sql)
+	}
+	if strings.Contains(stmt.Sql, "REPLACE") {
+		t.Errorf("Save 不得再用 REPLACE: %s", stmt.Sql)
+	}
+	// 零值也要写进去——Save 的语义是「整行落库」，不是「只写非零字段」
+	if !strings.Contains(stmt.Sql, "`port` = VALUES(`port`)") {
+		t.Errorf("ODKU 子句应覆盖全部已知列: %s", stmt.Sql)
+	}
+
+	batch, err := table.GetBatchSaveSQLWithArgs([]proto.Message{
+		&testpb.GolangTest{Id: 1}, &testpb.GolangTest{Id: 2},
+	})
+	if err != nil {
+		t.Fatalf("GetBatchSaveSQLWithArgs: %v", err)
+	}
+	if !strings.Contains(batch.Sql, "ON DUPLICATE KEY UPDATE") || strings.Contains(batch.Sql, "REPLACE") {
+		t.Errorf("BatchSave 必须用 ODKU: %s", batch.Sql)
+	}
+
+	// 整行推倒重来的旧语义保留为显式逃生口，只是不再是 Save 的默认
+	replace, err := table.GetReplaceSQLWithArgs(&testpb.GolangTest{Id: 7})
+	if err != nil {
+		t.Fatalf("GetReplaceSQLWithArgs: %v", err)
+	}
+	if !strings.HasPrefix(replace.Sql, "REPLACE INTO `golang_test`") {
+		t.Errorf("REPLACE 逃生口应当保留: %s", replace.Sql)
+	}
+}
+
+// TestRenameStillSupportedByDefault 改名保留数据是本库的招牌特性，默认行为不变。
+func TestRenameStillSupportedByDefault(t *testing.T) {
+	table := newMessageTable(&testpb.GolangTest{})
+	ipField := table.Descriptor.Fields().ByName("ip")
+	ipType := table.getMySQLFieldType(ipField)
+
+	clauses, err := table.buildAlterClauses(alignedCols(table, map[string]columnMeta{
+		"old_ip": {colType: ipType, fieldNum: ipField.Number()},
+	}, "ip"), false)
+	if err != nil {
+		t.Fatalf("默认应当允许改名: %v", err)
+	}
+	want := fmt.Sprintf("CHANGE COLUMN `old_ip` `ip` %s COMMENT 'pb:%d'", ipType, ipField.Number())
+	if joined := strings.Join(clauses, " | "); !strings.Contains(joined, want) {
+		t.Errorf("缺少改名子句 %q: %s", want, joined)
+	}
+}
+
+// TestFieldNumberReuseIsRefused 字段号被复用（跨族类型）一律拒绝，不设开关。
+//
+// 修复前会静默生成 CHANGE COLUMN，MySQL 的隐式类型转换把旧列内容整列吃掉，
+// 而本库「永不 DROP COLUMN」的保护在这里完全帮不上忙。
+func TestFieldNumberReuseIsRefused(t *testing.T) {
+	table := newMessageTable(&testpb.GolangTest{})
+	pidField := table.Descriptor.Fields().ByName("player_id") // pb:6，bigint
+
+	// 线上 pb:6 是一列文本（旧字段留下的），proto 里 pb:6 已经是 bigint 了
+	current := alignedCols(table, map[string]columnMeta{
+		"legacy_note": {colType: "mediumtext", fieldNum: pidField.Number()},
+	}, "player_id")
+
+	_, err := table.buildAlterClauses(current, false)
+	if !errors.Is(err, ErrFieldNumberReused) {
+		t.Fatalf("字段号复用必须拒绝，实际 err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "legacy_note") || !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("错误信息应指出具体列名并提示 reserved: %v", err)
+	}
+}
+
+// TestExpandOnlyGuard ExpandOnly 放行纯新增、拦下 MODIFY/CHANGE。
+//
+// 滚动发布时 MODIFY/CHANGE 会被新旧副本来回执行（本库没有 schema 版本概念）；
+// ADD COLUMN 没有这个问题，旧版本的 SQL 里根本不会出现新列名。
+func TestExpandOnlyGuard(t *testing.T) {
+	table := newMessageTable(&testpb.GolangTest{})
+	ipField := table.Descriptor.Fields().ByName("ip")
+
+	// 纯新增：放行
+	current := alignedCols(table, nil, "player_id")
+	clauses, err := table.buildAlterClauses(current, true)
+	if err != nil {
+		t.Fatalf("ExpandOnly 应放行纯新增: %v", err)
+	}
+	if len(clauses) != 1 || !strings.HasPrefix(clauses[0], "ADD COLUMN `player_id`") {
+		t.Errorf("期望仅一条 ADD COLUMN，实际 %v", clauses)
+	}
+
+	// 类型不兼容触发 MODIFY：拦下
+	current = alignedCols(table, map[string]columnMeta{
+		"ip": {colType: "int", fieldNum: ipField.Number()},
+	}, "ip")
+	if _, err := table.buildAlterClauses(current, true); !errors.Is(err, ErrExpandOnlyViolation) {
+		t.Fatalf("ExpandOnly 应拦下 MODIFY，实际 err=%v", err)
+	} else if !strings.Contains(err.Error(), "MODIFY COLUMN") {
+		t.Errorf("错误信息应列出具体语句: %v", err)
+	}
+	// 关掉开关就是既有行为
+	if _, err := table.buildAlterClauses(current, false); err != nil {
+		t.Errorf("关掉 ExpandOnly 后不应报错: %v", err)
+	}
+
+	// 改名触发 CHANGE：拦下
+	current = alignedCols(table, map[string]columnMeta{
+		"old_ip": {colType: table.getMySQLFieldType(ipField), fieldNum: ipField.Number()},
+	}, "ip")
+	if _, err := table.buildAlterClauses(current, true); !errors.Is(err, ErrExpandOnlyViolation) {
+		t.Fatalf("ExpandOnly 应拦下 CHANGE，实际 err=%v", err)
+	}
+}
+
+// alignedCols 造一份"与 proto 完全对齐"的线上列快照，再按 extra 覆盖、按 drop 删列。
+func alignedCols(table *MessageTable, extra map[string]columnMeta, drop ...string) map[string]columnMeta {
+	cols := map[string]columnMeta{}
+	fields := table.Descriptor.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		cols[string(fd.Name())] = columnMeta{colType: table.getMySQLFieldType(fd), fieldNum: fd.Number()}
+	}
+	for _, name := range drop {
+		delete(cols, name)
+	}
+	for name, meta := range extra {
+		cols[name] = meta
+	}
+	return cols
 }
 
 // TestBuildAlterClausesRenameByFieldNumber 单元测试：迁移时根据 proto 字段号(Field id)
@@ -2512,7 +2691,10 @@ func TestBuildAlterClausesRenameByFieldNumber(t *testing.T) {
 		"player":   {colType: "mediumblob", fieldNum: 5},
 	}
 
-	clauses := table.buildAlterClauses(current)
+	clauses, err := table.buildAlterClauses(current, false)
+	if err != nil {
+		t.Fatalf("buildAlterClauses: %v", err)
+	}
 	joined := strings.Join(clauses, " | ")
 
 	// 按字段号识别到改名：CHANGE COLUMN `ip_addr` `ip`
@@ -2707,6 +2889,57 @@ func TestDatetimePrecisionMigration(t *testing.T) {
 		{"datetime(6)", "DATETIME(6)", true, "已经一致，不动"},
 		{"timestamp(6)", "DATETIME(6)", true, "timestamp 映射到 datetime，精度一致"},
 		{"datetime(6)", "DATETIME", true, "线上精度更高时不降级（降级会丢数据）"},
+	}
+	for _, c := range cases {
+		if got := isTypeMatch(c.current, c.target); got != c.want {
+			t.Errorf("isTypeMatch(%q, %q) = %v, 期望 %v（%s）", c.current, c.target, got, c.want, c.why)
+		}
+	}
+}
+
+// TestSchemaSyncNeverNarrows 自动同步只许拓宽，绝不许收窄。
+//
+// 修复前有两类反向：varchar/char 与 float/double 的长度比较方向是反的
+// （写成了 target >= current）；整数族与文本族干脆没有方向判断——int 与 bigint
+// 是不同的 baseType，在 currentBase != targetBase 处就直接判不兼容，两个方向都ALTER。
+//
+// 在滚动发布下这是P0：本库没有schema版本概念，每个进程都把自己的proto当成唯一正确的
+// 目标结构。v2把uint32拓宽成uint64之后，任何一个还在跑v1的副本**一重启**就把列
+// MODIFY回int unsigned——不写任何数据，schema就在新旧副本之间来回翻面。
+func TestSchemaSyncNeverNarrows(t *testing.T) {
+	cases := []struct {
+		current, target string
+		want            bool
+		why             string
+	}{
+		// 同基础类型的长度/精度
+		{"varchar(64)", "varchar(32)", true, "线上更宽，不动它（收窄会截断已有数据）"},
+		{"varchar(32)", "varchar(64)", false, "线上更窄，必须拓宽，否则写入报1406"},
+		{"double", "float", true, "线上精度更高，不降"},
+		{"float", "double", false, "线上精度不足，必须拓宽"},
+
+		// 整数族跨类型
+		{"bigint unsigned", "int unsigned NOT NULL DEFAULT 0", true, "线上更宽，不收窄"},
+		{"int unsigned", "bigint unsigned NOT NULL DEFAULT 0", false, "线上更窄，必须拓宽"},
+		{"bigint", "tinyint NOT NULL DEFAULT 0", true, "线上更宽，不收窄"},
+		{"tinyint", "bigint NOT NULL DEFAULT 0", false, "线上更窄，必须拓宽"},
+		{"bigint unsigned", "int NOT NULL DEFAULT 0", false, "有无符号是值域方向，不是宽窄，必须ALTER"},
+		{"bigint", "int unsigned NOT NULL DEFAULT 0", false, "同上，反向"},
+
+		// 文本族跨类型：2026-08-19实测事故——线上mediumtext被varchar(255)的一侧重建，
+		// 同一条写入在宽列副本成功、窄列副本报1406，且不可复现。
+		{"mediumtext", "varchar(255)", true, "线上更宽，不收窄"},
+		{"varchar(255)", "MEDIUMTEXT", false, "线上更窄，必须拓宽"},
+		{"longtext", "MEDIUMTEXT", true, "线上更宽，不收窄"},
+		{"text", "MEDIUMTEXT", false, "线上更窄，必须拓宽"},
+
+		// 二进制族
+		{"mediumblob", "varbinary(255)", true, "线上更宽，不收窄"},
+		{"varbinary(255)", "MEDIUMBLOB", false, "线上更窄，必须拓宽"},
+
+		// 跨族没有可比性
+		{"int", "MEDIUMTEXT", false, "跨族一律判不兼容"},
+		{"mediumtext", "bigint NOT NULL DEFAULT 0", false, "跨族一律判不兼容"},
 	}
 	for _, c := range cases {
 		if got := isTypeMatch(c.current, c.target); got != c.want {

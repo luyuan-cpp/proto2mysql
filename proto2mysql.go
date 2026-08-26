@@ -44,6 +44,34 @@ var (
 	ErrNoRowsFound        = errors.New("no rows found")
 	ErrDuplicateKey       = errors.New("duplicate key")
 	ErrBatchSizeExceeded  = fmt.Errorf("batch size exceeds maximum %d", BatchInsertMaxSize)
+
+	// ErrFieldNumberReused 线上某列的 pb:N 与新字段号相同，但两者类型跨族不可转换。
+	//
+	// 这不是改名，是**字段号被复用**：proto 里删掉一个字段后，把它的编号让给了一个
+	// 类型完全不同的新字段。库按字段号识别列，于是会生成 CHANGE COLUMN legacy foo
+	// bigint —— MySQL 的隐式类型转换会把 mediumtext 里的内容整列吃掉，而本库
+	// 「永不 DROP COLUMN」的保护在这里帮不上忙。
+	//
+	// 字段号是 protobuf 的身份，**永不复用**：删字段要用 reserved。
+	ErrFieldNumberReused = errors.New("proto field number reused with an incompatible column type")
+
+	// ErrExpandOnlyViolation 开了 ExpandOnly 之后，本次对齐产生了非「纯新增」的变更。
+	//
+	// 滚动 / 金丝雀发布时必须打开那个开关。本库没有 schema 版本概念，每个进程都把自己的
+	// proto 当成唯一正确的目标结构，所以只要新旧两版同时在跑，MODIFY / CHANGE 就会被
+	// 两边**来回改**——不需要写任何数据，一次重启就翻一次面。ADD COLUMN 没有这个问题：
+	// 旧版本的 SQL 里根本不会出现新列名。
+	ErrExpandOnlyViolation = errors.New("schema change is not expand-only")
+
+	// ErrUnsupportedFieldKind proto 字段类型没有 MySQL 列类型映射。
+	//
+	// sint32 / sint64 / fixed32 / fixed64 / sfixed32 / sfixed64 都不支持——它们的
+	// zigzag / 定长编码没有直接对应的 MySQL 列类型。改用 int32 / int64 / uint32 / uint64
+	// 即可（取值范围完全一样，只是线上编码不同）。
+	//
+	// 早先这些类型静默回落成 TEXT：建表一路成功，跑到**第一次写入**才抛错，
+	// 而那时列已经建出来了、可能还上了线。现在在生成 DDL 时就 fail-fast。
+	ErrUnsupportedFieldKind = errors.New("field kind has no MySQL type mapping")
 )
 
 // SqlWithArgs 存储带?占位符的SQL和对应的参数列表
@@ -77,6 +105,10 @@ type MessageTable struct {
 	selectAllSQLWithoutSemicolon string
 	insertSQLTemplate            string
 	replaceSQLPrefix             string
+
+	// fieldNumbers 本消息认识的全部 proto 字段号，用于缓存条目的超集判定。
+	// 详见 cache.go 里 encodeCacheEntry 的注释。
+	fieldNumbers map[int32]struct{}
 
 	// fieldNameToDesc 缓存字段名到描述符的映射
 	fieldNameToDesc map[string]protoreflect.FieldDescriptor
@@ -143,6 +175,13 @@ type DB struct {
 	Tables map[string]*MessageTable
 	DB     *sql.DB
 	DBName string
+	// ExpandOnly 只允许「纯新增」的结构变更。默认 false（保持既有行为，改名照常保留数据）。
+	//
+	// **滚动 / 金丝雀发布必须打开**：本库没有 schema 版本概念，每个进程都把自己的 proto
+	// 当成唯一正确的目标结构，新旧两版同时在跑时 MODIFY / CHANGE 会被两边来回执行——
+	// 不写任何数据，一次重启就翻一次面。ADD COLUMN 没有这个问题（旧版本的 SQL 里根本
+	// 不会出现新列名），所以放行。违反时返回 ErrExpandOnlyViolation 并列出具体语句。
+	ExpandOnly bool
 	// tx 非空时所有增删改查走事务（由RunInTransaction设置）
 	tx *sql.Tx
 	// cache 可选的cache-aside缓存（EnableCache注入）；nil时全部直读DB
@@ -329,46 +368,38 @@ func isTypeMatch(currentType, targetType string) bool {
 	current := parseMySQLType(currentType)
 	target := parseMySQLType(targetType)
 
-	// 基础类型映射表
-	typeMap := map[string]string{
-		"bool":       "tinyint",
-		"integer":    "int",
-		"mediumtext": "mediumtext",
-		"text":       "text",
-		"blob":       "blob",
-		"mediumblob": "mediumblob",
-		"datetime":   "datetime",
-		"timestamp":  "datetime",
-		"varchar":    "varchar",
-		"char":       "char",
-	}
+	currentBase := normalizeBaseType(current.baseType)
+	targetBase := normalizeBaseType(target.baseType)
 
-	// 映射基础类型
-	currentBase := typeMap[current.baseType]
-	if currentBase == "" {
-		currentBase = current.baseType
-	}
-	targetBase := typeMap[target.baseType]
-	if targetBase == "" {
-		targetBase = target.baseType
-	}
-
-	// 基础类型不匹配直接返回false
+	// 基础类型不同：同族跨类型（int↔bigint、varchar↔mediumtext、float↔double）
+	// 按容量阶梯判方向；跨族（比如 int↔mediumtext）没有可比性，一律判不兼容。
 	if currentBase != targetBase {
+		for _, family := range typeFamilies {
+			currentRank, okCurrent := family.ranks[currentBase]
+			targetRank, okTarget := family.ranks[targetBase]
+			if !okCurrent || !okTarget {
+				continue
+			}
+			if family.isInteger && current.unsigned != target.unsigned {
+				// 有无符号决定的是值域方向而不是宽窄，两边都可能装不下对方，必须ALTER。
+				return false
+			}
+			return currentRank >= targetRank
+		}
 		return false
 	}
 
-	// 特殊处理不同类型的长度兼容性
+	// 同一基础类型，再比长度/精度/符号。口径同上：线上装得下目标就不动它。
 	switch currentBase {
 	case "varchar", "char":
-		// 目标长度大于等于当前长度视为兼容
-		return target.length >= current.length
-	case "int", "bigint", "tinyint", "smallint":
-		// 无符号属性必须一致
+		// 线上更宽时不动它（收窄会截断已有数据）。
+		return current.length >= target.length
+	case "tinyint", "smallint", "mediumint", "int", "bigint":
+		// 位宽相同，只剩有无符号要比。
 		return current.unsigned == target.unsigned
 	case "float", "double":
-		// 小数位兼容检查
-		return target.decimal >= current.decimal
+		// 小数位同理，线上精度更高时不降。
+		return current.decimal >= target.decimal
 	case "datetime":
 		// 括号里的是小数秒精度(fsp)。线上精度低于目标时必须ALTER，
 		// 否则老表停留在DATETIME(0)，写入的毫秒会被静默丢掉——精度修了等于没修。
@@ -379,9 +410,121 @@ func isTypeMatch(currentType, targetType string) bool {
 	return true
 }
 
+// baseTypeAliases 把等价写法折叠到同一个名字再比较。
+var baseTypeAliases = map[string]string{
+	"bool":       "tinyint",
+	"integer":    "int",
+	"mediumtext": "mediumtext",
+	"text":       "text",
+	"blob":       "blob",
+	"mediumblob": "mediumblob",
+	"datetime":   "datetime",
+	"timestamp":  "datetime",
+	"varchar":    "varchar",
+	"char":       "char",
+}
+
+// normalizeBaseType 归一基础类型名；表里没有的原样返回。
+func normalizeBaseType(baseType string) string {
+	if mapped, ok := baseTypeAliases[baseType]; ok {
+		return mapped
+	}
+	return baseType
+}
+
+// typeFamily 是一族可互相比较"谁更宽"的MySQL类型。
+type typeFamily struct {
+	ranks     map[string]int
+	isInteger bool
+}
+
+// typeFamilies 同族容量阶梯。判定口径统一为「线上装得下目标就不动它」：
+//
+//	线上容量 >= 目标容量  → 兼容，不生成ALTER
+//	线上容量 <  目标容量  → 必须ALTER拓宽
+//
+// 这条口径原先只有datetime分支做对了，另外两族是坏的：
+//
+//   - varchar/char 与 float/double 的方向**是反的**（写的是 target >= current）。
+//     后果双向都错：线上varchar(50)、proto要varchar(100)时判「兼容」不拓宽，
+//     写100字符报1406；线上varchar(100)、proto要varchar(50)时反而去ALTER收窄。
+//   - 整数族**根本没有方向判断**。int与bigint是不同的baseType，在上面的
+//     currentBase != targetBase 处就直接判不兼容了，于是**两个方向都ALTER**。
+//
+// 为什么这在滚动发布下是P0：本库没有schema版本概念，每个进程都把自己的proto当成
+// 唯一正确的目标结构。v2把uint32拓宽成uint64之后，任何一个还在跑v1的副本**一重启**
+// 就把列MODIFY回int unsigned——不需要写任何数据，schema就在新旧副本之间来回翻面。
+// 文本族同理：2026-08-19实测撞到过线上mediumtext被varchar(255)的一侧重建，
+// 同一条写入在宽列副本成功、窄列副本报1406，且不可复现。
+//
+// 收窄是有损操作，与本库「永不DROP COLUMN」的既有立场一致：确实要收窄请手写ALTER。
+var typeFamilies = []typeFamily{
+	{ranks: map[string]int{"tinyint": 1, "smallint": 2, "mediumint": 3, "int": 4, "bigint": 5}, isInteger: true},
+	{ranks: map[string]int{"char": 1, "varchar": 2, "tinytext": 3, "text": 4, "mediumtext": 5, "longtext": 6}},
+	{ranks: map[string]int{"binary": 1, "varbinary": 2, "tinyblob": 3, "blob": 4, "mediumblob": 5, "longblob": 6}},
+	{ranks: map[string]int{"float": 1, "double": 2}},
+}
+
 // escapeMySQLName 将MySQL标识符整体转义，兼容包含点号的protobuf full name表名。
 func escapeMySQLName(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+}
+
+// TextIndexPrefixLength 在 TEXT/BLOB 列上建索引时使用的前缀长度。
+//
+// MySQL **不允许**对 TEXT/BLOB 列建不带前缀长度的索引，直接报
+// Error 1170 BLOB/TEXT column used in key specification without a key length。
+// 而本库把 string 映射成 MEDIUMTEXT，所以只要在 string 列上声明了 index / unique_key，
+// 不补前缀产出的就是一条 MySQL 会拒绝执行的 DDL。
+//
+// 这个洞长期没暴露，是因为测试只比对 SQL 字符串、从不真的执行：拿本仓库自带的
+// tools/proto2sql/testdata/account.proto 生成建表语句打到 MySQL 8.4 上就是 Error 1170。
+//
+// 191 是 utf8mb4 下的经典安全值（旧的 767 字节索引上限 ÷ 4）。
+// 设为 0 表示不补前缀——产出的 DDL 建不了表，只在做历史输出比对时才有意义。
+const TextIndexPrefixLength = 191
+
+// validateFieldKinds 检查所有字段都有 MySQL 类型映射，没有就 fail-fast。
+//
+// 放在生成 DDL 的入口做，而不是等到第一次写入才由 pbconv 抛错——那时列已经
+// 按 TEXT 建出来了，改回正确类型是跨族 MODIFY，会把数据吃成 0。
+func (m *MessageTable) validateFieldKinds() error {
+	fields := m.Descriptor.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		fieldDesc := fields.Get(i)
+		if fieldDesc.IsMap() || fieldDesc.IsList() || fieldDesc.Kind() == protoreflect.MessageKind {
+			continue // 这三类统一落 MEDIUMBLOB，不查映射表
+		}
+		if _, ok := MySQLFieldTypes[fieldDesc.Kind()]; !ok {
+			return fmt.Errorf("%w: 表 %s 的字段 %s（%s）。"+
+				"sint32/sint64/fixed32/fixed64/sfixed32/sfixed64 都不支持，"+
+				"改用 int32/int64/uint32/uint64 即可（取值范围一样，只是线上编码不同）",
+				ErrUnsupportedFieldKind, m.tableName, fieldDesc.Name(), fieldDesc.Kind())
+		}
+	}
+	return nil
+}
+
+// needsIndexPrefix 该列建索引时是否必须带前缀长度（TEXT/BLOB 系列都要）。
+func (m *MessageTable) needsIndexPrefix(col string) bool {
+	if TextIndexPrefixLength <= 0 {
+		return false
+	}
+	fieldDesc, ok := m.fieldNameToDesc[col]
+	if !ok {
+		return false
+	}
+	colType := strings.ToUpper(m.getMySQLFieldType(fieldDesc))
+	return strings.Contains(colType, "TEXT") || strings.Contains(colType, "BLOB")
+}
+
+// indexColumn 索引里的一列，必要时补前缀长度。见 TextIndexPrefixLength 的注释。
+func (m *MessageTable) indexColumn(col string) string {
+	escaped := escapeMySQLName(col)
+	if m.needsIndexPrefix(col) {
+		return fmt.Sprintf("%s(%d)", escaped, TextIndexPrefixLength)
+	}
+	return escaped
 }
 
 // GetCreateTableSQL 生成创建表的SQL语句
@@ -404,7 +547,7 @@ func (m *MessageTable) GetCreateTableSQL() string {
 	if len(m.primaryKey) > 0 {
 		primaryKeys := make([]string, len(m.primaryKey))
 		for i, pk := range m.primaryKey {
-			primaryKeys[i] = escapeMySQLName(pk)
+			primaryKeys[i] = m.indexColumn(pk)
 		}
 		pkClause := fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(primaryKeys, ","))
 		if m.tidbNonclusteredPK {
@@ -418,7 +561,7 @@ func (m *MessageTable) GetCreateTableSQL() string {
 			cols := strings.Split(indexCols, ",")
 			quotedCols := make([]string, len(cols))
 			for i, col := range cols {
-				quotedCols[i] = escapeMySQLName(strings.TrimSpace(col))
+				quotedCols[i] = m.indexColumn(strings.TrimSpace(col))
 			}
 			indexName := fmt.Sprintf("idx_%s_%d", m.tableName, idx)
 			indexes = append(indexes, fmt.Sprintf("  INDEX %s (%s)", escapeMySQLName(indexName), strings.Join(quotedCols, ",")))
@@ -429,7 +572,12 @@ func (m *MessageTable) GetCreateTableSQL() string {
 		uniqueCols := strings.Split(m.uniqueKeys, ",")
 		quotedUniqueCols := make([]string, len(uniqueCols))
 		for i, col := range uniqueCols {
-			quotedUniqueCols[i] = escapeMySQLName(strings.TrimSpace(col))
+			name := strings.TrimSpace(col)
+			if m.needsIndexPrefix(name) {
+				log.Printf("warning: unique key on TEXT/BLOB column %s in table %s only enforces "+
+					"uniqueness over the first %d characters", name, m.tableName, TextIndexPrefixLength)
+			}
+			quotedUniqueCols[i] = m.indexColumn(name)
 		}
 		indexes = append(indexes, fmt.Sprintf("  UNIQUE KEY %s (%s)", escapeMySQLName("uk_"+m.tableName), strings.Join(quotedUniqueCols, ",")))
 	}
@@ -597,10 +745,15 @@ func (p *DB) getTableColumnMeta(tableName string) (map[string]columnMeta, error)
 // clearColumnCache 清除表字段缓存
 func (p *DB) clearColumnCache(tableName string) {
 	if table, ok := p.Tables[tableName]; ok {
-		table.columnsMu.Lock()
-		table.cachedColumns = nil
-		table.columnsMu.Unlock()
+		table.clearColumnCache()
 	}
+}
+
+// clearColumnCache 清除本表的字段类型缓存（DDL 变更后必须调用）。
+func (m *MessageTable) clearColumnCache() {
+	m.columnsMu.Lock()
+	m.cachedColumns = nil
+	m.columnsMu.Unlock()
 }
 
 // CreateOrUpdateTable 创建表或同步已有表字段结构。
@@ -621,14 +774,39 @@ func (p *DB) CreateOrUpdateTable(m proto.Message) error {
 //
 // 所有生成的列均带 COMMENT 'pb:N'，以便后续迁移继续按字段号识别列。
 // 不修改传入的 currentCols（内部拷贝一份）。
-func (m *MessageTable) buildAlterClauses(currentCols map[string]columnMeta) []string {
+func (m *MessageTable) buildAlterClauses(currentCols map[string]columnMeta, expandOnly bool) ([]string, error) {
 	remaining := make(map[string]columnMeta, len(currentCols))
+	if err := m.validateFieldKinds(); err != nil {
+		return nil, err
+	}
+
+	// byFieldNum 必须**确定性**构建。
+	//
+	// 早先是直接 `byFieldNum[meta.fieldNum] = name` 边遍历 currentCols 边写——而 Go 的
+	// map 迭代顺序是随机化的。正常情况下一个 pb:N 只对应一列，看不出问题；但线上表出现
+	// 两列带同一个 pb:N 时（DBA 照 SHOW CREATE TABLE 复制一个备份列就会），
+	// **每次运行挑中的列都可能不同**，产出的 CHANGE COLUMN 也就不同——其中一种会去
+	// 改那个备份列。同一个库、同一份 proto、同一个线上结构，跑两次得到两份 DDL，
+	// Go 版连自己都不逐字节相同（Python 侧的 dict 推导是确定的，所以只有 Go 有这个问题）。
+	//
+	// 冲突时取**列名字典序最小**的那个：规则简单、可复现，且与"先建的列通常名字更短/更早"
+	// 无关——重点是无论跑多少次都给出同一个答案。同时打一条告警，因为重复的 pb:N
+	// 本身就是个需要人工处理的异常。
 	byFieldNum := make(map[protoreflect.FieldNumber]string, len(currentCols))
 	for name, meta := range currentCols {
 		remaining[name] = meta
-		if meta.fieldNum != 0 {
-			byFieldNum[meta.fieldNum] = name
+		if meta.fieldNum == 0 {
+			continue
 		}
+		if prev, dup := byFieldNum[meta.fieldNum]; dup {
+			log.Printf("warning: table %s 有多列带同一个 pb:%d 注释（%q 与 %q），"+
+				"按列名字典序取较小者以保证可复现；请人工确认哪一列才是真正的数据列",
+				m.tableName, meta.fieldNum, prev, name)
+			if prev < name {
+				continue
+			}
+		}
+		byFieldNum[meta.fieldNum] = name
 	}
 
 	var alterSQLs []string
@@ -657,7 +835,25 @@ func (m *MessageTable) buildAlterClauses(currentCols map[string]columnMeta) []st
 
 		// 2) 字段号匹配（改名场景）：找到注释字段号一致但列名不同的现有列
 		if oldName, ok := byFieldNum[fieldNum]; ok {
-			if _, still := remaining[oldName]; still {
+			if oldMeta, still := remaining[oldName]; still {
+				if !isRenameConvertible(oldMeta.colType, targetType) {
+					// 类型跨族对不上，这不是改名，是字段号被复用了。照常生成 CHANGE 的话，
+					// MySQL 的隐式转换会把旧列内容整列吃掉，而本库「永不 DROP COLUMN」
+					// 的保护在这里完全帮不上忙。
+					return nil, fmt.Errorf("%w: 表 %s 的列 %s（%s，pb:%d）与新字段 %s（%s，pb:%d）"+
+						"类型跨族，无法当作改名处理。字段号是 protobuf 的身份，永不复用："+
+						"删字段请用 reserved，新字段另取一个没用过的编号。"+
+						"若确实要把这一列的数据转成新类型，请人工写 ALTER 并自行确认转换语义",
+						ErrFieldNumberReused, m.tableName, oldName, oldMeta.colType, fieldNum,
+						fieldName, targetType, fieldNum)
+				}
+				// 改名能保留数据，但库无法判断谁新谁旧：滚动发布时新旧两版会把这一列来回
+				// 改名（v2 改成新名 → 任何一个 v1 副本重启又改回旧名 → v2 立刻 Error 1054）。
+				// 所以这里必须留痕。
+				log.Printf("warning: table %s: column %s -> %s by field number pb:%d. "+
+					"滚动发布期间新旧副本会来回改名，正确做法是 expand→migrate→contract"+
+					"（先加新列、双写回填、下个版本再删旧列）；或对同步调用打开 ExpandOnly",
+					m.tableName, oldName, fieldName, fieldNum)
 				alterSQLs = append(alterSQLs, fmt.Sprintf("CHANGE COLUMN %s %s %s%s",
 					escapeMySQLName(oldName), escapeMySQLName(fieldName), targetType, comment))
 				delete(remaining, oldName)
@@ -668,7 +864,43 @@ func (m *MessageTable) buildAlterClauses(currentCols map[string]columnMeta) []st
 		// 3) 全新字段
 		alterSQLs = append(alterSQLs, fmt.Sprintf("ADD COLUMN %s %s%s", escapeMySQLName(fieldName), targetType, comment))
 	}
-	return alterSQLs
+
+	if expandOnly {
+		var offenders []string
+		for _, clause := range alterSQLs {
+			if !strings.HasPrefix(clause, "ADD COLUMN") {
+				offenders = append(offenders, clause)
+			}
+		}
+		if len(offenders) > 0 {
+			return nil, fmt.Errorf("%w: 表 %s 的本次对齐含非「纯新增」变更，ExpandOnly 下拒绝执行：\n  %s\n"+
+				"  这些语句在滚动发布下会被新旧副本来回执行。请改成 expand→migrate→contract 三步，"+
+				"或人工审核后单独执行", ErrExpandOnlyViolation, m.tableName, strings.Join(offenders, "\n  "))
+		}
+	}
+
+	return alterSQLs, nil
+}
+
+// isRenameConvertible 线上旧列的类型，能不能安全承接改名后的新类型。
+//
+// 改名保留数据靠的是 CHANGE COLUMN，而 MySQL 会对它做**隐式类型转换**。同基础类型、
+// 或同族（int↔bigint、varchar↔mediumtext）都算能接；跨族（mediumtext↔bigint）一律
+// 不能——那多半根本不是改名，而是 proto 里把一个已删字段的编号让给了类型完全不同的新字段。
+func isRenameConvertible(currentType, targetType string) bool {
+	currentBase := normalizeBaseType(parseMySQLType(currentType).baseType)
+	targetBase := normalizeBaseType(parseMySQLType(targetType).baseType)
+	if currentBase == targetBase {
+		return true
+	}
+	for _, family := range typeFamilies {
+		_, okCurrent := family.ranks[currentBase]
+		_, okTarget := family.ranks[targetBase]
+		if okCurrent && okTarget {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateTableField 同步表字段（表不存在则创建，存在则对齐字段类型）
@@ -689,14 +921,23 @@ func (p *DB) syncTableSchema(registryKey string, table *MessageTable) error {
 		return fmt.Errorf("检查表 %s 存在性: %w", table.tableName, err)
 	}
 
-	// 如果表不存在，直接创建
+	// 表不存在就先建。注意这里**刻意不 return**，建完继续往下走列对齐。
+	//
+	// 建表语句是 CREATE TABLE IF NOT EXISTS，在并发下可能整条是 no-op：两个版本的
+	// 进程同时冷启动到空库时，先到的那个按自己的 proto 建表，后到的这条 CREATE 只会
+	// 拿到一条 Warning 1050——不报错、不改结构。早先这里直接 return nil，于是后到进程
+	// 独有的新列**从未被添加**，而它自己启动成功、零异常，一直到第一条 SELECT 才报
+	// Error 1054 Unknown column；且表存在性缓存已置 true，重启也不重新对齐，**不自愈**。
+	//
+	// 落到对齐路径上就没有这个问题：getTableColumnMeta 直读 INFORMATION_SCHEMA
+	// （不走列类型缓存），拿到的是真实建成的结构，缺什么补什么。自己建成功的那条路径
+	// 上 buildAlterClauses 返回空，只多一次元信息查询，代价可以忽略。
 	if !exists {
 		createSQL := table.GetCreateTableSQL()
 		if _, err := p.DB.ExecContext(p.context(), createSQL); err != nil {
 			return fmt.Errorf("创建表 %s 失败: %w, SQL: %s", table.tableName, err, createSQL)
 		}
 		p.updateTableExistsCache(table.tableName, true)
-		return nil
 	}
 
 	// 表已存在，同步字段结构（读取列类型 + 字段号注释，支持按 Field id 改名保留数据）
@@ -705,7 +946,10 @@ func (p *DB) syncTableSchema(registryKey string, table *MessageTable) error {
 		return fmt.Errorf("获取表 %s 字段: %w", registryKey, err)
 	}
 
-	alterSQLs := table.buildAlterClauses(currentCols)
+	alterSQLs, err := table.buildAlterClauses(currentCols, p.ExpandOnly)
+	if err != nil {
+		return err
+	}
 
 	// 补齐缺失的主键。
 	//
@@ -739,6 +983,17 @@ func (p *DB) syncTableSchema(registryKey string, table *MessageTable) error {
 		}
 	}
 
+	// 补齐 proto 里声明了、但线上还没有的索引。
+	//
+	// 早先索引只出现在 CREATE TABLE 分支：表一旦建成，之后在 .proto 里新加
+	// index / unique_key **完全不生效**，而且零提示——查询照常能跑，只是走全表扫描，
+	// 数据量上来才表现为"莫名其妙变慢"，谁也想不到是建表选项没落地。
+	indexClauses, err := p.missingIndexClauses(table)
+	if err != nil {
+		return err
+	}
+	alterSQLs = append(alterSQLs, indexClauses...)
+
 	// 执行ALTER TABLE（如果有需要修改的列或需要补主键）
 	if len(alterSQLs) > 0 {
 		alterSQL := fmt.Sprintf("ALTER TABLE %s %s", escapeMySQLName(table.tableName), strings.Join(alterSQLs, ", "))
@@ -751,9 +1006,166 @@ func (p *DB) syncTableSchema(registryKey string, table *MessageTable) error {
 			return fmt.Errorf("更新表 %s 结构失败: %w, SQL: %s", table.tableName, err, alterSQL)
 		}
 		p.clearColumnCache(registryKey) // 清除缓存，下次查询时重新加载字段
+		p.awaitSchemaVisible(registryKey, table, alterSQLs)
 	}
 
 	return nil
+}
+
+const (
+	// SchemaSettleTimeout 等 DDL 在所有节点生效的最长时间。
+	SchemaSettleTimeout = 60 * time.Second
+	// SchemaSettleInterval 就绪探测的轮询间隔。
+	SchemaSettleInterval = 200 * time.Millisecond
+)
+
+// addedColumnNames 从 ALTER 子句里挑出本次**新增**的列名。
+//
+// 只等这些列：MODIFY / CHANGE 改的是已有列，回读时本来就看得见，
+// 等它们既没意义又会把探测拖长。
+func addedColumnNames(alterSQLs []string) map[string]struct{} {
+	const prefix = "ADD COLUMN `"
+	names := make(map[string]struct{})
+	for _, clause := range alterSQLs {
+		if !strings.HasPrefix(clause, prefix) {
+			continue
+		}
+		rest := clause[len(prefix):]
+		if end := strings.Index(rest, "`"); end > 0 {
+			names[strings.ReplaceAll(rest[:end], "``", "`")] = struct{}{}
+		}
+	}
+	return names
+}
+
+// awaitSchemaVisible 等到 ALTER 的结果**真的能被看见**，再放行后续 SQL。
+//
+// MySQL 单机上这一步立刻就过（DDL 返回即生效），几乎零开销。
+//
+// 但 **TiDB 的 DDL 是异步 online 的**：ALTER 语句返回时，schema 变更只是进了 DDL 队列，
+// 各个 TiDB 节点要按 lease（默认 45s）分批加载新的 schema 版本。库执行完 ALTER 立刻按
+// 新 proto 发 INSERT/SELECT，这段窗口里连到**还没加载新 schema 的节点**就会报
+// Unknown column——启动日志漂亮，第一批请求全挂。原先这里没有任何等待或重试。
+//
+// 实现上刻意**不去检测"后端是不是 TiDB"**：版本号/变量嗅探很容易被兼容层骗过，
+// 而"回读 information_schema 直到结构真的对上"是纯行为判定，对 MySQL、TiDB、
+// 以及任何自称兼容的实现都成立。
+func (p *DB) awaitSchemaVisible(registryKey string, table *MessageTable, alterSQLs []string) {
+	want := addedColumnNames(alterSQLs)
+	if len(want) == 0 {
+		return // 本次没有新增列（只有 MODIFY / CHANGE / 索引），无需等待
+	}
+
+	deadline := time.Now().Add(SchemaSettleTimeout)
+	for {
+		live, err := p.getTableColumnMeta(registryKey)
+		if err != nil {
+			log.Printf("warning: 回读表 %s 结构失败，跳过就绪探测：%v", table.tableName, err)
+			return
+		}
+		if len(live) == 0 {
+			// 一列都读不到 = 根本看不见这张表（权限/库名不对/驱动不给结果）。
+			// 真表不可能零列，所以这不是"还没生效"，继续轮询只会白等到超时。
+			return
+		}
+
+		var missing []string
+		for name := range want {
+			if _, ok := live[name]; !ok {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			// 只告警不返回错误：结构可能确实还在后台排队。
+			// 报错会把"慢"升级成"起不来"。
+			slices.Sort(missing)
+			log.Printf("warning: 表 %s 的结构变更在 %v 内没有全部可见（仍缺 %v）。"+
+				"TiDB 的 DDL 是异步的，可能仍在后台排队；"+
+				"若后续 SQL 报 Unknown column，等一个 schema lease 再重试",
+				table.tableName, SchemaSettleTimeout, missing)
+			return
+		}
+		time.Sleep(SchemaSettleInterval)
+	}
+}
+
+// existingIndexNames 线上这张表已有的索引名（不含 PRIMARY）。
+func (p *DB) existingIndexNames(tableName string) (map[string]struct{}, error) {
+	rows, err := p.DB.QueryContext(p.context(),
+		"SELECT DISTINCT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS "+
+			"WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", p.DBName, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	names := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		if name != "" && name != "PRIMARY" {
+			names[name] = struct{}{}
+		}
+	}
+	return names, rows.Err()
+}
+
+// missingIndexClauses proto 里声明了、线上却没有的索引，生成 ADD INDEX / ADD UNIQUE KEY。
+//
+// **只加不删**：线上多出来的索引一律不动（可能是 DBA 按查询模式手工加的，库没有立场去删）。
+// 与「永不 DROP COLUMN」是同一个立场。
+//
+// 索引名与 CREATE TABLE 分支保持一致（idx_<表名>_<序号> / uk_<表名>），否则同一份 proto
+// 在"新建表"和"老表补索引"两条路径上会产出不同的索引名。
+func (p *DB) missingIndexClauses(table *MessageTable) ([]string, error) {
+	if len(table.indexes) == 0 && table.uniqueKeys == "" {
+		return nil, nil // proto 里一个索引都没声明，不必去查 information_schema
+	}
+
+	existing, err := p.existingIndexNames(table.tableName)
+	if err != nil {
+		// 查不到就跳过，不阻断结构同步
+		log.Printf("warning: 读取表 %s 的既有索引失败，本次跳过索引补齐：%v", table.tableName, err)
+		return nil, nil
+	}
+
+	var clauses []string
+	for idx, indexCols := range table.indexes {
+		name := fmt.Sprintf("idx_%s_%d", table.tableName, idx)
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		cols := strings.Split(indexCols, ",")
+		quoted := make([]string, len(cols))
+		for i, col := range cols {
+			quoted[i] = table.indexColumn(strings.TrimSpace(col))
+		}
+		clauses = append(clauses, fmt.Sprintf("ADD INDEX %s (%s)",
+			escapeMySQLName(name), strings.Join(quoted, ",")))
+		log.Printf("table %s 补索引 %s (%s)", table.tableName, name, strings.Join(quoted, ","))
+	}
+
+	if table.uniqueKeys != "" {
+		name := "uk_" + table.tableName
+		if _, ok := existing[name]; !ok {
+			cols := strings.Split(table.uniqueKeys, ",")
+			quoted := make([]string, len(cols))
+			for i, col := range cols {
+				quoted[i] = table.indexColumn(strings.TrimSpace(col))
+			}
+			clauses = append(clauses, fmt.Sprintf("ADD UNIQUE KEY %s (%s)",
+				escapeMySQLName(name), strings.Join(quoted, ",")))
+			log.Printf("warning: table %s 补唯一键 %s (%s)：线上若已有重复行，这条 ALTER 会失败，"+
+				"需先人工去重再重试（fail-closed，不会静默跳过）",
+				table.tableName, name, strings.Join(quoted, ","))
+		}
+	}
+	return clauses, nil
 }
 
 // tableHasPrimaryKey 检查线上表当前是否已存在主键约束。
@@ -1426,7 +1838,54 @@ func (p *DB) UpdateFieldsIfVersion(message proto.Message, versionField string, f
 	return affected > 0, nil
 }
 
-// GetReplaceSQLWithArgs 生成参数化的REPLACE语句
+// valuesUpdateClause 生成 `col = VALUES(col)` 列表，覆盖本进程认识的**全部**列。
+//
+// ON DUPLICATE KEY UPDATE 只动子句里点名的列，本进程不认识的列原样保留——
+// 这正是它比 REPLACE 安全的地方。
+//
+// 注意：VALUES() 在 MySQL 8.0.20 起被标记 deprecated（官方建议改 AS new 行别名），
+// 至今仍可用，本库沿用它以兼容 5.7（与 sqlbuilder 里的 SetNew 等一致）。
+func (m *MessageTable) valuesUpdateClause() string {
+	parts := make([]string, 0, m.Descriptor.Fields().Len())
+	for i := 0; i < m.Descriptor.Fields().Len(); i++ {
+		name := escapeMySQLName(string(m.Descriptor.Fields().Get(i).Name()))
+		parts = append(parts, name+" = VALUES("+name+")")
+	}
+	return strings.Join(parts, ", ")
+}
+
+// GetSaveSQLWithArgs 整行落库：INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col), ...
+//
+// 取代 REPLACE INTO 作为 Save 的实现——同样是「有则更新、无则插入」，
+// 但**不会清掉本进程不认识的列**。
+func (m *MessageTable) GetSaveSQLWithArgs(message proto.Message) (*SqlWithArgs, error) {
+	stmt, err := m.GetInsertSQLWithArgs(message)
+	if err != nil {
+		return nil, err
+	}
+	stmt.Sql += " ON DUPLICATE KEY UPDATE " + m.valuesUpdateClause()
+	return stmt, nil
+}
+
+// GetBatchSaveSQLWithArgs 批量整行落库，语义同 GetSaveSQLWithArgs。
+func (m *MessageTable) GetBatchSaveSQLWithArgs(messages []proto.Message) (*SqlWithArgs, error) {
+	stmt, err := m.GetBatchInsertSQLWithArgs(messages)
+	if err != nil {
+		return nil, err
+	}
+	stmt.Sql += " ON DUPLICATE KEY UPDATE " + m.valuesUpdateClause()
+	return stmt, nil
+}
+
+// GetReplaceSQLWithArgs 生成参数化的REPLACE语句。
+//
+// ⚠️ REPLACE 的语义是「先 DELETE 再 INSERT」，语句里没提到的列不是"保持原值"，
+// 是**回到列默认值**。而列清单来自本进程的 descriptor，所以滚动发布时旧版本进程
+// 执行一次，新版本刚写进去的列就没了；本库「永不 DROP COLUMN」的保护在这里帮不上忙，
+// 因为丢的是数据不是列。还会触发外键级联删除。
+//
+// DB.Save 已经改走 GetSaveSQLWithArgs（ON DUPLICATE KEY UPDATE，只覆盖本进程认识的列）。
+// 本方法保留为**显式逃生口**：确实需要「整行推倒重来、未提及列一律归位」时才用。
 func (m *MessageTable) GetReplaceSQLWithArgs(message proto.Message) (*SqlWithArgs, error) {
 	if err := m.validateMessageDescriptor(message); err != nil {
 		return nil, err
@@ -1537,6 +1996,26 @@ func (m *MessageTable) Init() {
 	if len(m.primaryKey) > 0 {
 		m.primaryKeyField = desc.Fields().ByName(protoreflect.Name(m.primaryKey[0]))
 	}
+
+	m.fieldNumbers = make(map[int32]struct{}, fieldCount)
+	for i := 0; i < fieldCount; i++ {
+		m.fieldNumbers[int32(desc.Fields().Get(i).Number())] = struct{}{}
+	}
+
+	if m.tableName == string(desc.FullName()) {
+		// 没有 table_name 选项，表名退化成 proto full name（含 package）。
+		//
+		// 这在 package 一改就出事：v2 把 package 从 game.v1 改成 game.v2，表名跟着变
+		// → 建出一张**全新的空表**，v1 的数据留在旧表里，而**两边都不报错**——
+		// 服务照常起来，玩家数据"凭空消失"。
+		//
+		// RegisterAllTables 强制要求 table_name（走那条路是安全的），
+		// 但手工 RegisterTable / newMessageTable 不受保护，所以这里告警。
+		log.Printf("warning: 表 %s 没有声明 table_name 选项，表名退化为 proto full name。"+
+			"proto 的 package 一改表名就跟着变，会建出一张空表而旧数据留在旧表里，"+
+			"且两边都不报错。建议在 .proto 里显式写 option (proto2mysql.table_name)",
+			desc.FullName())
+	}
 }
 
 // NewDB 创建新的数据库实例
@@ -1567,7 +2046,15 @@ func (p *DB) GetCreateTableSQL(message proto.Message) string {
 	return table.GetCreateTableSQL()
 }
 
-// Save 执行参数化的REPLACE操作（直接用DB，无Tx）
+// Save 整行落库：有则更新、无则插入（直接用DB，无Tx）。
+//
+// 走 INSERT ... ON DUPLICATE KEY UPDATE，**不是** REPLACE INTO。REPLACE 的语义是
+// 「先 DELETE 再 INSERT」，语句里没提到的列会**回到默认值**——而列清单来自本进程的
+// descriptor，所以滚动发布时旧版本进程 Save 一次，新版本刚写进去的列就没了，且零报错。
+// ODKU 只动子句里点名的列，本进程不认识的列原样保留。
+//
+// 需要「整行推倒重来」的旧语义时，显式用 GetReplaceSQLWithArgs。
+// （顺带：GormDB.Save 一直用的就是 clause.OnConflict{UpdateAll}，本次改动让两者语义一致。）
 func (p *DB) Save(message proto.Message) error {
 	tableName := GetTableName(message)
 	table, ok := p.Tables[tableName]
@@ -1575,21 +2062,21 @@ func (p *DB) Save(message proto.Message) error {
 		return fmt.Errorf("%w: %s", ErrTableNotFound, tableName)
 	}
 
-	sqlWithArgs, err := table.GetReplaceSQLWithArgs(message)
+	sqlWithArgs, err := table.GetSaveSQLWithArgs(message)
 	if sqlWithArgs == nil || err != nil {
-		return fmt.Errorf("generate replace SQL for table %s: %w", tableName, err)
+		return fmt.Errorf("generate save SQL for table %s: %w", tableName, err)
 	}
 
 	_, err = p.conn().Exec(sqlWithArgs.Sql, sqlWithArgs.Args...)
 	if err != nil {
-		return fmt.Errorf("exec replace for table %s: sql=%s, args=%v, err=%w",
+		return fmt.Errorf("exec save for table %s: sql=%s, args=%v, err=%w",
 			tableName, sqlWithArgs.Sql, sqlWithArgs.Args, err)
 	}
 	p.invalidateMessages(table, message)
 	return nil
 }
 
-// BatchSave 执行批量REPLACE操作（自动分批）
+// BatchSave 批量整行落库（自动分批），语义同 Save。
 func (p *DB) BatchSave(messages []proto.Message) error {
 	if len(messages) == 0 {
 		return nil
@@ -1611,9 +2098,9 @@ func (p *DB) BatchSave(messages []proto.Message) error {
 			end = len(messages)
 		}
 
-		sqlWithArgs, err := table.GetBatchReplaceSQLWithArgs(messages[i:end])
+		sqlWithArgs, err := table.GetBatchSaveSQLWithArgs(messages[i:end])
 		if err != nil {
-			return fmt.Errorf("generate batch replace SQL for table %s: %w", table.tableName, err)
+			return fmt.Errorf("generate batch save SQL for table %s: %w", table.tableName, err)
 		}
 		if _, err := p.conn().Exec(sqlWithArgs.Sql, sqlWithArgs.Args...); err != nil {
 			return fmt.Errorf("exec batch replace for table %s: args len=%d, err=%w",
@@ -2294,12 +2781,70 @@ func (p *DB) registerTableFromDescriptor(md protoreflect.MessageDescriptor) {
 // 表不存在则创建，存在则对齐字段类型（等价于对每张表调用 UpdateTableField）。
 // 常与 RegisterAllTables 搭配：先自动注册，再一次性建/更新全部 MySQL 表。
 func (p *DB) SyncAllTables() error {
-	for key, table := range p.Tables {
-		if err := p.syncTableSchema(key, table); err != nil {
+	acquired := p.acquireSyncLock()
+	if acquired {
+		defer p.releaseSyncLock()
+	}
+
+	// 表名排序后再遍历。Go 的 map 迭代是随机化的，不排序的话多个副本会以不同顺序
+	// 抢同一批表的元数据锁，可能互相等待；而且失败时"改到第几张表"每次都不一样，
+	// 排障时对不上。
+	keys := make([]string, 0, len(p.Tables))
+	for key := range p.Tables {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	for _, key := range keys {
+		if err := p.syncTableSchema(key, p.Tables[key]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+const (
+	// SyncLockName DDL 咨询锁的名字（同一个库内全局）。
+	SyncLockName = "proto2mysql:sync"
+	// SyncLockTimeoutSeconds 抢 DDL 咨询锁的等待秒数。
+	SyncLockTimeoutSeconds = 30
+)
+
+// acquireSyncLock 抢 DDL 咨询锁。拿到返回 true；超时 / 不支持 / 出错都返回 false 并降级。
+//
+// 没有这把锁时：N 个副本同时冷启动 → 一个 ALTER 成功、其余全部撞
+// Error 1060 Duplicate column name → 返回错误 → 启动失败。下一次重启会成功
+// （列已经存在，对齐结果为空），所以它是**"自愈式蒙对"**——日志里留下一串启动失败、
+// 服务最终起来了，很容易被当成偶发 flake 忽略，直到某次重启风暴把它放大。
+//
+// 拿不到锁**不阻断**：GET_LOCK 超时返回 0、连接异常返回 NULL，而 TiDB 等兼容实现
+// 不一定支持这个函数。所以拿不到只降级为"无锁执行 + 一条告警"——把可用性看得比
+// "锁一定要拿到"更重：拿不到锁最坏是撞 1060、重启自愈；因为拿不到锁就拒绝启动，
+// 是把一个并发问题升级成可用性事故。
+func (p *DB) acquireSyncLock() bool {
+	var got sql.NullInt64
+	err := p.conn().QueryRow(
+		"SELECT GET_LOCK(?, ?)", SyncLockName, SyncLockTimeoutSeconds).Scan(&got)
+	if err != nil {
+		log.Printf("warning: 拿不到 DDL 咨询锁（%s），本次结构同步无锁执行：%v。"+
+			"多副本同时启动时可能撞 Error 1060，重启即可自愈", SyncLockName, err)
+		return false
+	}
+	if !got.Valid || got.Int64 != 1 {
+		// 返回 0 = 等超时了（别人正在改）；NULL = 连接出错。两种都只告警不阻断。
+		log.Printf("warning: DDL 咨询锁 %s 未取得（valid=%v value=%d），本次结构同步无锁执行",
+			SyncLockName, got.Valid, got.Int64)
+		return false
+	}
+	return true
+}
+
+func (p *DB) releaseSyncLock() {
+	var released sql.NullInt64
+	if err := p.conn().QueryRow("SELECT RELEASE_LOCK(?)", SyncLockName).Scan(&released); err != nil {
+		// 连接断开时锁会被服务端自动释放，这里失败不影响正确性。
+		log.Printf("warning: 释放 DDL 咨询锁 %s 失败（连接断开时会自动释放）：%v", SyncLockName, err)
+	}
 }
 
 // TableOption 表选项函数

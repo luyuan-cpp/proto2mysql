@@ -332,14 +332,35 @@ func parseContainer(reflection protoreflect.Message, fieldDesc protoreflect.Fiel
 	return nil
 }
 
-// setScalarDefault 空字符串时把标量字段重置为默认值（bytes/message/enum保持不变，与旧行为一致）
+// setScalarDefault 列值为NULL/空时，把字段重置为默认值。
+//
+// **必须覆盖所有类型，否则会跨行串位。** 原先这里只处理 8 种标量，刻意跳过
+// bytes / enum / message（注释写的是"与旧行为一致"）。后果是：
+//
+//	out := &KitchenSink{Id: 1}; db.FindOneByPK(out)   // alice: payload=..., tier=GOLD
+//	out.Id = 2;                 db.FindOneByPK(out)   // bob 这三列都是 NULL
+//	// → out.Payload / out.Tier / out.Sub 全是 alice 的值，**bob 拿到了 alice 的数据**
+//
+// 而 FindOneByPK(out) 的 out 既是入参（主键）又是出参，复用同一个 message 正是这个
+// API 的天然用法，所以这不是"误用"。同样的洞在 Python 侧 _set_scalar_default 里
+// 一模一样，两边一起修。
+//
+// 用 Set(fd.Default()) 而不是 Clear()：对 proto3 optional 字段，Set 会把字段标记为
+// **已设置**，Clear 则是未设置——差一个 has 位，再写回数据库时 InsertSetFields 就会
+// 少一列。MessageKind 没有可 Set 的默认值，只能 Clear（子消息本来就没有
+// "零值已设置"这一说）。
 func setScalarDefault(reflection protoreflect.Message, fieldDesc protoreflect.FieldDescriptor) {
 	switch fieldDesc.Kind() {
 	case protoreflect.Int32Kind, protoreflect.Int64Kind,
 		protoreflect.Uint32Kind, protoreflect.Uint64Kind,
 		protoreflect.FloatKind, protoreflect.DoubleKind,
-		protoreflect.BoolKind, protoreflect.StringKind:
+		protoreflect.BoolKind, protoreflect.StringKind,
+		// ↓ 这两类原先被漏掉，导致跨行串位
+		protoreflect.BytesKind, protoreflect.EnumKind:
 		reflection.Set(fieldDesc, fieldDesc.Default())
+	case protoreflect.MessageKind, protoreflect.GroupKind:
+		// 子消息没有可 Set 的默认值，只能清掉
+		reflection.Clear(fieldDesc)
 	}
 }
 

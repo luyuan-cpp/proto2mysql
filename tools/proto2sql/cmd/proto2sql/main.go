@@ -78,8 +78,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// -drop 的警告必须**跟着生成物走**：光在 CLI 帮助里写没用，
+	// 真正的风险是这份 .sql 被别人拿去 `mysql < schema.sql`——它看起来就是一份
+	// 普通的建表脚本，一敲整库蒸发。
+	banner := ""
+	if drop {
+		banner = dropModeBanner
+	}
+
 	if single != "" {
 		var b strings.Builder
+		b.WriteString(banner)
 		for _, t := range tables {
 			b.WriteString(t.SQL)
 			b.WriteString("\n\n")
@@ -95,13 +104,30 @@ func main() {
 
 	for _, t := range tables {
 		path := filepath.Join(outDir, t.Name+".sql")
-		if err := os.WriteFile(path, []byte(t.SQL+"\n"), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(banner+t.SQL+"\n"), 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "error: 写文件 %s 失败: %v\n", path, err)
 			os.Exit(1)
 		}
 		fmt.Printf("生成表 %s -> %s\n", t.Name, path)
 	}
 }
+
+// dropModeBanner -drop 生成物的文件头警告。
+//
+// 光在 CLI 帮助和文档里写警告是不够的——真正的风险是**生成出来的 .sql 文件被别人
+// 拿去执行**：它看起来就是一份普通的建表脚本，`mysql < schema.sql` 一敲，整库蒸发。
+// 所以警告必须**跟着文件走**，谁打开都能第一眼看见。
+const dropModeBanner = `-- ############################################################################
+-- ##  危险：本文件由 proto2sql -drop 生成，每张表前都有 DROP TABLE IF EXISTS
+-- ##
+-- ##  执行它会删掉这些表及其全部数据，且不可恢复。
+-- ##  仅用于空库初始化 / 测试库重建，切勿用于生产库或服务启动流程。
+-- ##
+-- ##  要在保留数据的前提下演进结构，请改用运行时库：
+-- ##      DB.GenerateMigrationSQL()   只产出 ALTER，不删数据（推荐：交人工/CI 审核）
+-- ##      DB.SyncAllTables()          直接执行 ALTER
+-- ############################################################################
+`
 
 func splitCSV(s string) []string {
 	if s == "" {

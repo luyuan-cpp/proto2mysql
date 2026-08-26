@@ -1,10 +1,13 @@
 package proto2mysql
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
@@ -88,6 +91,17 @@ func (p *DB) cacheEnabled() bool {
 }
 
 // cacheKeyFor 生成缓存key：pb:<表名>:<主键值1>:<主键值2>...
+//
+// ⚠️ **schema 版本刻意不进 key，而是进 value 的头部**（见 encodeCacheEntry）。
+//
+// 看起来把指纹拼进 key 更省事——新旧版本天然不共享条目、投毒路径直接消失。
+// 但失效路径与读路径共用本函数：v1 写库后去删的是**自己那个指纹**的 key，
+// v2 缓存的那条永远没人删，于是「读到残缺数据」被升级成「跨版本永久脏读」，
+// 一直脏到 TTL 到期。比原来的问题更糟。
+//
+// 放进 value 头部则：key 不变 → 失效跨版本照常生效；读时做超集判定 →
+// 只有「认识更多字段的一方读到认识更少的一方写的条目」才 miss（单向），
+// 雪崩面小，而且是原地覆写，不会把旧 key 空间搁浅占内存。
 func cacheKeyFor(table *MessageTable, message proto.Message) (string, error) {
 	values, err := table.primaryKeyValues(message)
 	if err != nil {
@@ -102,6 +116,98 @@ func cacheKeyFor(table *MessageTable, message proto.Message) (string, error) {
 		b.WriteString(fmt.Sprint(v))
 	}
 	return b.String(), nil
+}
+
+// ── 缓存条目的信封 ──────────────────────────────────────────────────────
+//
+// 存进缓存的**不是**裸 pb 字节，而是「写入方认识哪些字段」+ pb 字节。
+//
+// 为什么必须记这个：缓存里的 message 是**按列从 MySQL 读出来再填进去的**，不是从
+// pb 字节 Unmarshal 的——所以 protobuf 的 unknown-fields 保留机制在这里完全不适用。
+// 旧版本进程的 message 里根本没有新字段，它写进缓存的是一条**残缺**记录。滚动发布时
+// v1 写、v2 读，v2 就拿到新字段的零值，而 MySQL 里是有值的；v2 写完只 Del key，
+// v1 下次读又投毒一次，表现为**读到的值随机闪烁**。最阴的是 MySQL 里的数据自始至终
+// 是对的，零日志零异常，只能靠对账发现。
+//
+// 判定规则是**超集**：写入方的字段集 ⊇ 读取方的字段集时才采用。
+//   - v1 读 v2 写的条目 → v2 认识得更多，采用（多出来的字段对 v1 就是 unknown fields）
+//   - v2 读 v1 写的条目 → v1 认识得更少，**当未命中回源**
+//
+// 所以 miss 是单向的，滚动发布期间的雪崩面比"换 key"小得多。
+//
+// 布局（与 Python 版逐字节一致，可共用同一个 Redis）：
+//
+//	magic   4B   "P2MC"
+//	version 1B   0x01
+//	count   varint          字段号个数
+//	fields  count 个 varint  字段号，**升序**
+//	payload 剩余全部          pb 序列化字节
+//
+// 老条目（裸 pb 字节，没有 magic）读到就当未命中——安全，且会被下一次写覆盖。
+const (
+	cacheEntryVersion = 1
+)
+
+var cacheEntryMagic = []byte("P2MC")
+
+// encodeCacheEntry 把「写入方认识的字段号集合」和 pb 字节打包成一条缓存条目。
+func encodeCacheEntry(fieldNumbers map[int32]struct{}, payload []byte) []byte {
+	nums := make([]int, 0, len(fieldNumbers))
+	for num := range fieldNumbers {
+		nums = append(nums, int(num))
+	}
+	// 必须排序：同一个集合要产出同一份字节，否则每次写入的内容都不同。
+	slices.Sort(nums)
+
+	out := make([]byte, 0, len(cacheEntryMagic)+1+binary.MaxVarintLen64*(len(nums)+1)+len(payload))
+	out = append(out, cacheEntryMagic...)
+	out = append(out, cacheEntryVersion)
+	out = binary.AppendUvarint(out, uint64(len(nums)))
+	for _, num := range nums {
+		out = binary.AppendUvarint(out, uint64(num))
+	}
+	return append(out, payload...)
+}
+
+// decodeCacheEntry 拆包；不是本库写的条目（无 magic / 版本不认 / 截断）返回 ok=false。
+func decodeCacheEntry(data []byte) (fields map[int32]struct{}, payload []byte, ok bool) {
+	if !bytes.HasPrefix(data, cacheEntryMagic) {
+		return nil, nil, false
+	}
+	pos := len(cacheEntryMagic)
+	if pos >= len(data) || data[pos] != cacheEntryVersion {
+		return nil, nil, false
+	}
+	pos++
+
+	count, n := binary.Uvarint(data[pos:])
+	if n <= 0 {
+		return nil, nil, false
+	}
+	pos += n
+
+	fields = make(map[int32]struct{}, count)
+	for i := uint64(0); i < count; i++ {
+		num, n := binary.Uvarint(data[pos:])
+		if n <= 0 {
+			return nil, nil, false
+		}
+		pos += n
+		fields[int32(num)] = struct{}{}
+	}
+	return fields, data[pos:], true
+}
+
+// missingFieldNumbers 返回 want 里而 have 里没有的字段号（升序），空则表示 have ⊇ want。
+func missingFieldNumbers(have, want map[int32]struct{}) []int {
+	var missing []int
+	for num := range want {
+		if _, ok := have[num]; !ok {
+			missing = append(missing, int(num))
+		}
+	}
+	slices.Sort(missing)
+	return missing
 }
 
 // cacheGetProto 读缓存并反序列化到message；返回是否命中。任何错误都视为未命中（降级）。
@@ -119,10 +225,31 @@ func (p *DB) cacheGetProto(table *MessageTable, message proto.Message) bool {
 		return false
 	}
 
-	if err := proto.Unmarshal(data, message); err != nil {
+	writerFields, payload, ok := decodeCacheEntry(data)
+	if !ok {
+		// 没有信封：要么是老版本写的裸 pb 字节，要么根本不是本库写的。
+		// 一律当未命中回源——下一次写会把它原地覆盖成带信封的条目。
+		log.Printf("proto2mysql: cache entry %s has no envelope (fallback to db)", key)
+		return false
+	}
+	if missing := missingFieldNumbers(writerFields, table.fieldNumbers); len(missing) > 0 {
+		// 写入方认识的字段比我少，这条记录对我来说是**残缺**的。直接用会让我新增的
+		// 那些字段静默拿到零值，而库里其实是有值的。
+		log.Printf("proto2mysql: cache entry %s was written by an older schema "+
+			"(missing pb:%v); falling back to db", key, missing)
+		return false
+	}
+
+	// 解析到临时对象再拷回去：原先是直接 Unmarshal 进调用方的 message，
+	// 而 proto.Unmarshal 会先 Reset —— 解析一旦失败，调用方 message 的**主键已经被清成 0**，
+	// 上层拿着 0 回去查库，于是查错行/查不到，且看不出根因。
+	scratch := message.ProtoReflect().New().Interface()
+	if err := proto.Unmarshal(payload, scratch); err != nil {
 		log.Printf("proto2mysql: cache unmarshal %s failed (fallback to db): %v", key, err)
 		return false
 	}
+	proto.Reset(message)
+	proto.Merge(message, scratch)
 	return true
 }
 
@@ -138,6 +265,7 @@ func (p *DB) cacheSetProto(table *MessageTable, message proto.Message) {
 		log.Printf("proto2mysql: cache marshal %s failed: %v", key, err)
 		return
 	}
+	data = encodeCacheEntry(table.fieldNumbers, data)
 	if err := p.cache.Set(context.Background(), key, data, p.cacheTTL); err != nil {
 		log.Printf("proto2mysql: cache set %s failed: %v", key, err)
 	}

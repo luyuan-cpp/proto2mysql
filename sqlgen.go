@@ -79,7 +79,10 @@ func (p *DB) GenerateMigrationSQL(m proto.Message) (string, error) {
 		return "", fmt.Errorf("get table %s columns: %w", tableName, err)
 	}
 
-	alterSQLs := table.buildAlterClauses(currentCols)
+	alterSQLs, err := table.buildAlterClauses(currentCols, p.ExpandOnly)
+	if err != nil {
+		return "", err
+	}
 	if len(alterSQLs) == 0 {
 		return "", nil
 	}

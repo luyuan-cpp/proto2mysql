@@ -1,6 +1,7 @@
 package proto2mysql
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -71,6 +72,10 @@ func newCacheTestDB(cache Cache) *DB {
 }
 
 // TestCacheKeyFormat 缓存key为 pb:<表名>:<主键值...>
+//
+// schema 版本刻意**不进 key**：失效路径与读路径共用 cacheKeyFor，指纹进 key 会让
+// v1 写库后删的是自己那个指纹的 key、v2 缓存的那条永远没人删，把"读到残缺数据"
+// 升级成"跨版本永久脏读"。版本信息在 value 头部（见 encodeCacheEntry）。
 func TestCacheKeyFormat(t *testing.T) {
 	db := newCacheTestDB(newFakeCache())
 
@@ -94,6 +99,62 @@ func TestCacheKeyFormat(t *testing.T) {
 	want2 := "pb:" + GetTableName(&testpb.GolangTest{}) + ":1:2"
 	if key2 != want2 {
 		t.Errorf("key = %q, 预期 %q", key2, want2)
+	}
+}
+
+// TestCacheEntryRoundTrip 信封编解码；与 Python 版必须逐字节一致（可能共用同一个 Redis）。
+func TestCacheEntryRoundTrip(t *testing.T) {
+	payload := []byte{0x08, 0x2a}
+	set := map[int32]struct{}{3: {}, 1: {}, 2: {}}
+	blob := encodeCacheEntry(set, payload)
+
+	if !bytes.HasPrefix(blob, append(append([]byte{}, cacheEntryMagic...), cacheEntryVersion)) {
+		t.Fatalf("信封头不对: %x", blob)
+	}
+	fields, out, ok := decodeCacheEntry(blob)
+	if !ok {
+		t.Fatal("decodeCacheEntry 应当成功")
+	}
+	if len(fields) != 3 || !bytes.Equal(out, payload) {
+		t.Errorf("拆包结果不对: fields=%v payload=%x", fields, out)
+	}
+	// 字段号必须升序写入，保证同一集合产出同一份字节
+	same := encodeCacheEntry(map[int32]struct{}{1: {}, 2: {}, 3: {}}, payload)
+	if !bytes.Equal(blob, same) {
+		t.Errorf("同一集合产出的字节必须相同: %x vs %x", blob, same)
+	}
+	if _, _, ok := decodeCacheEntry([]byte("not-an-envelope")); ok {
+		t.Error("无 magic 的条目必须判为非本库写入")
+	}
+	if _, _, ok := decodeCacheEntry(append(append([]byte{}, cacheEntryMagic...), 0x99)); ok {
+		t.Error("版本不认的条目必须判为非本库写入")
+	}
+}
+
+// TestCacheEntrySupersetRule 超集判定：写入方字段集 ⊇ 读取方才采用。
+//
+// 这正是"旧版本把残缺记录写进缓存、新版本读到零值"那条投毒路径的闸门，
+// 而且 miss 是单向的——认识更多字段的一方读到旧条目才 miss。
+func TestCacheEntrySupersetRule(t *testing.T) {
+	table := newMessageTable(&testpb.GolangTest{})
+	mine := table.fieldNumbers
+
+	older := map[int32]struct{}{}
+	for num := range mine {
+		if num != 6 { // 旧版本不认识 player_id(pb:6)
+			older[num] = struct{}{}
+		}
+	}
+	if missing := missingFieldNumbers(older, mine); len(missing) != 1 || missing[0] != 6 {
+		t.Errorf("旧写入方应缺 pb:6，实际 %v", missing)
+	}
+
+	newer := map[int32]struct{}{999: {}}
+	for num := range mine {
+		newer[num] = struct{}{}
+	}
+	if missing := missingFieldNumbers(newer, mine); len(missing) != 0 {
+		t.Errorf("新写入方是超集，不该 miss，实际缺 %v", missing)
 	}
 }
 

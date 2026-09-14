@@ -123,6 +123,22 @@ func (m *MessageTable) getMySQLFieldType(fieldDesc protoreflect.FieldDescriptor)
 		baseType = "TEXT" // 默认类型
 	}
 
+	// 恢复服务器 go/db/go.mod 依赖的本地主键类型修复。
+	// 只按完整字段名匹配主键（含复合主键），不改变非键列和完整键比较语义。
+	// TEXT/BLOB 无法直接作为 MySQL 主键，191 对 utf8mb4 保持可索引。
+	for _, primaryKey := range m.primaryKey {
+		if primaryKey != fieldName {
+			continue
+		}
+		switch fieldDesc.Kind() {
+		case protoreflect.StringKind:
+			baseType = "VARCHAR(191)"
+		case protoreflect.BytesKind:
+			baseType = "VARBINARY(191)"
+		}
+		break
+	}
+
 	// 处理 nullable 字段
 	if m.isNullableField(fieldName) {
 		baseType = strings.ReplaceAll(baseType, " NOT NULL", "")

@@ -29,7 +29,8 @@ const (
 
 // field option 字段号
 const (
-	optNumFieldNullable = 600100 // 该字段允许为 NULL
+	optNumFieldNullable  = 600100 // 该字段允许为 NULL
+	optNumFieldMaxLength = 600101 // 主键/唯一键 string/bytes 列的最大长度
 )
 
 // file option 字段号
@@ -61,7 +62,7 @@ func TableNameFromDescriptor(md protoreflect.MessageDescriptor) (string, bool) {
 }
 
 // TableOptionsFromDescriptor 从消息描述符读取建表配置，转换为 TableOption 列表。
-// 支持的 message option：表名/主键/自增/索引/唯一键；field option：nullable。
+// 支持的 message option：表名/主键/自增/索引/唯一键；field option：nullable、max_length。
 // RegisterTable / GenerateCreateTableSQL 会自动应用这些选项，代码传入的 TableOption 优先级更高（后应用覆盖）。
 func TableOptionsFromDescriptor(md protoreflect.MessageDescriptor) []TableOption {
 	var opts []TableOption
@@ -113,8 +114,17 @@ func TableOptionsFromDescriptor(md protoreflect.MessageDescriptor) []TableOption
 	for i := 0; i < fields.Len(); i++ {
 		fd := fields.Get(i)
 		rangeExtensions(fd.Options(), func(num protoreflect.FieldNumber, v protoreflect.Value) {
-			if num == optNumFieldNullable && v.Bool() {
-				nullable = append(nullable, string(fd.Name()))
+			switch num {
+			case optNumFieldNullable:
+				if v.Bool() {
+					nullable = append(nullable, string(fd.Name()))
+				}
+			case optNumFieldMaxLength:
+				// 用类型断言而不是 v.Uint()：别的库若在同一字段号上注册了非整数扩展，v.Uint() 会 panic。
+				// 显式写 0 也要传下去交给 validateTableOptions 拒绝，不能当成"没声明"而退回默认长度。
+				if n, ok := v.Interface().(uint32); ok {
+					opts = append(opts, WithMaxLength(string(fd.Name()), n))
+				}
 			}
 		})
 	}
@@ -161,6 +171,7 @@ var unknownOptionKinds = map[protoreflect.FieldNumber]protoreflect.Kind{
 	optNumIndex:               protoreflect.StringKind,
 	optNumUniqueKey:           protoreflect.StringKind,
 	optNumFieldNullable:       protoreflect.BoolKind,
+	optNumFieldMaxLength:      protoreflect.Uint32Kind,
 	optNumTiDBNonclusteredPK:  protoreflect.BoolKind,
 	optNumTiDBShardRowIDBits:  protoreflect.Uint32Kind,
 	optNumTiDBPreSplitRegions: protoreflect.Uint32Kind,

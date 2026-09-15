@@ -121,6 +121,21 @@ func (p *GormDB) BatchInsert(messages []proto.Message) error {
 		return nil
 	}
 
+	// 分批写入不是原子的：先按同样的分批方式把整批键列值校验完再开始写，见 validateKeyValues。
+	for i := 0; i < len(messages); i += BatchInsertMaxSize {
+		end := i + BatchInsertMaxSize
+		if end > len(messages) {
+			end = len(messages)
+		}
+		table, err := p.tableForMessage(messages[i])
+		if err != nil {
+			return err
+		}
+		if err := table.validateKeyValues(messages[i:end], false); err != nil {
+			return fmt.Errorf("batch insert rows from %d for table %s: %w", i, table.tableName, err)
+		}
+	}
+
 	for i := 0; i < len(messages); i += BatchInsertMaxSize {
 		end := i + BatchInsertMaxSize
 		if end > len(messages) {
@@ -337,6 +352,9 @@ func (p *GormDB) BatchSave(messages []proto.Message) error {
 			return err
 		}
 	}
+	if err := table.validateKeyValues(messages, false); err != nil {
+		return fmt.Errorf("batch save for table %s: %w", table.tableName, err)
+	}
 
 	for i, message := range messages {
 		if err := p.saveByPrimaryKey(table, message); err != nil {
@@ -401,7 +419,7 @@ func (p *GormDB) UpdateFieldsByPK(message proto.Message, fields ...string) error
 		if !ok {
 			return fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, field, table.tableName)
 		}
-		val, err := pbconv.SerializeFieldValue(message, desc)
+		val, err := table.serializeColumnValue(message, desc)
 		if err != nil {
 			return fmt.Errorf("serialize update field %s: %w", field, err)
 		}
@@ -447,7 +465,7 @@ func (p *GormDB) UpdateIfVersion(message proto.Message, versionField string) (bo
 	if err := table.requireNumericColumn(versionField); err != nil {
 		return false, err
 	}
-	curVersion, err := comparisonValue(message, versionDesc)
+	curVersion, err := table.comparisonValue(message, versionDesc)
 	if err != nil {
 		return false, fmt.Errorf("serialize version field %s: %w", versionField, err)
 	}
@@ -499,7 +517,7 @@ func (p *GormDB) UpdateFieldsIfVersion(message proto.Message, versionField strin
 	if err := table.requireNumericColumn(versionField); err != nil {
 		return false, err
 	}
-	curVersion, err := comparisonValue(message, versionDesc)
+	curVersion, err := table.comparisonValue(message, versionDesc)
 	if err != nil {
 		return false, fmt.Errorf("serialize version field %s: %w", versionField, err)
 	}
@@ -513,7 +531,7 @@ func (p *GormDB) UpdateFieldsIfVersion(message proto.Message, versionField strin
 		if !ok {
 			return false, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, name, table.tableName)
 		}
-		val, err := pbconv.SerializeFieldValue(message, desc)
+		val, err := table.serializeColumnValue(message, desc)
 		if err != nil {
 			return false, fmt.Errorf("serialize update field %s: %w", name, err)
 		}
@@ -591,6 +609,9 @@ func (p *GormDB) BatchDelete(messages []proto.Message) error {
 		if msg.ProtoReflect().Descriptor() != table.Descriptor {
 			return fmt.Errorf("messages have different descriptors")
 		}
+	}
+	if err := table.validateKeyValues(messages, true); err != nil {
+		return fmt.Errorf("batch delete for table %s: %w", table.tableName, err)
 	}
 
 	// ⚠️ 必须按**全部**主键列构造条件。原先这里只取 primaryKeyField
@@ -1039,7 +1060,7 @@ func (m *MessageTable) messageValues(message proto.Message, includeUnset bool, s
 			continue
 		}
 
-		val, err := pbconv.SerializeFieldValue(message, field)
+		val, err := m.serializeColumnValue(message, field)
 		if err != nil {
 			return nil, fmt.Errorf("serialize field %s: %w", field.Name(), err)
 		}
@@ -1092,7 +1113,7 @@ func (m *MessageTable) primaryKeySerializedValues(message proto.Message) ([]inte
 			return nil, fmt.Errorf("%w: primary key %s in table %s", ErrFieldNotFound, primaryKey, m.tableName)
 		}
 
-		val, err := pbconv.SerializeFieldValue(message, field)
+		val, err := m.serializeColumnValue(message, field)
 		if err != nil {
 			return nil, fmt.Errorf("serialize primary key %s: %w", primaryKey, err)
 		}

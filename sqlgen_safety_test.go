@@ -97,9 +97,10 @@ func TestValidateTableOptionsRejectsImplicitlyNullableOrPrefixPrimaryKey(t *test
 		opts []TableOption
 	}{
 		{
-			name: "text primary key is only prefix unique",
-			msg:  &testpb.GolangTest{},
-			opts: []TableOption{WithPrimaryKey("ip"), WithAutoIncrementKey("")},
+			// repeated string 整体序列化进 MEDIUMBLOB，只能建前缀索引，不能保证完整主键唯一
+			name: "repeated string primary key is only prefix unique",
+			msg:  repeatedStringProbeMessage(t),
+			opts: []TableOption{WithTableName("repeated_pk_probe"), WithPrimaryKey("tags")},
 		},
 		{
 			name: "timestamp primary key is implicitly nullable",
@@ -116,6 +117,46 @@ func TestValidateTableOptionsRejectsImplicitlyNullableOrPrefixPrimaryKey(t *test
 			}
 		})
 	}
+}
+
+// TestValidateTableOptionsAcceptsScalarStringPrimaryKey 标量 string 主键映射成 VARCHAR 整列索引，
+// 完整唯一且 NOT NULL，可以做主键。
+func TestValidateTableOptionsAcceptsScalarStringPrimaryKey(t *testing.T) {
+	ddl, err := GenerateCreateTableSQLChecked(&testpb.GolangTest{}, WithPrimaryKey("ip"), WithAutoIncrementKey(""))
+	if err != nil {
+		t.Fatalf("标量 string 主键应被接受，实际: %v", err)
+	}
+	for _, want := range []string{
+		"`ip` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+		"PRIMARY KEY (`ip`)",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("string 主键 DDL 缺少 %q:\n%s", want, ddl)
+		}
+	}
+}
+
+func repeatedStringProbeMessage(t *testing.T) *dynamicpb.Message {
+	t.Helper()
+	fd := &descriptorpb.FileDescriptorProto{
+		Name:    gproto.String("sqlgen_repeated_pk.proto"),
+		Package: gproto.String("sqlgenprobe"),
+		Syntax:  gproto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: gproto.String("RepeatedPK"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name:   gproto.String("tags"),
+				Number: gproto.Int32(1),
+				Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+				Label:  descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum(),
+			}},
+		}},
+	}
+	desc, err := protodesc.NewFile(fd, nil)
+	if err != nil {
+		t.Fatalf("构造 repeated string 描述符: %v", err)
+	}
+	return dynamicpb.NewMessage(desc.Messages().Get(0))
 }
 
 func TestValidateTableOptionsRejectsEmptyTableName(t *testing.T) {

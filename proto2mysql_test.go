@@ -1528,10 +1528,9 @@ func TestMySQLIdentifierEscaping(t *testing.T) {
 	for _, want := range []string{
 		"CREATE TABLE IF NOT EXISTS `" + tableName + "`",
 		"INDEX `idx_" + tableName + "_0` (`player_id`,`group_id`)",
-		// ip 是 string → MEDIUMTEXT。MySQL 不允许对 TEXT/BLOB 列建不带前缀长度的索引
-		// （Error 1170），所以这里必须带 (191)。早先不补前缀，产出的是一条 MySQL
-		// 会直接拒绝执行的 DDL——之所以长期没暴露，是因为测试只比对字符串、从不真的执行。
-		fmt.Sprintf("UNIQUE KEY `uk_%s` (`ip`(%d))", tableName, TextIndexPrefixLength),
+		// ip 在唯一键里 → VARCHAR(191) 键列，唯一键建在整列上：TEXT 前缀索引只保证前 191 个字符唯一。
+		"`ip` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+		fmt.Sprintf("UNIQUE KEY `uk_%s` (`ip`)", tableName),
 	} {
 		if !strings.Contains(createSQL, want) {
 			t.Fatalf("建表SQL缺少 %q\nSQL: %s", want, createSQL)
@@ -1540,20 +1539,38 @@ func TestMySQLIdentifierEscaping(t *testing.T) {
 }
 
 // TestTextIndexNeedsPrefixLength TEXT/BLOB 列上的索引必须带前缀长度，
-// 否则建表语句会被 MySQL 以 Error 1170 拒绝。
+// 否则建表语句会被 MySQL 以 Error 1170 拒绝。主键/唯一键里的 string 是 VARCHAR 键列，
+// 列类型是列的属性：它出现在任何索引里（包括普通索引）都建整列。
 func TestTextIndexNeedsPrefixLength(t *testing.T) {
-	pdb := NewDB()
 	msg := &testpb.GolangTest{}
-	pdb.RegisterTable(msg, WithIndexes("ip"), WithUniqueKey("ip"))
-	createSQL := pdb.GetCreateTableSQL(msg)
 
-	if strings.Contains(createSQL, "(`ip`)") {
-		t.Errorf("TEXT 列索引不能是裸列名（MySQL Error 1170）: %s", createSQL)
-	}
-	want := fmt.Sprintf("`ip`(%d)", TextIndexPrefixLength)
-	if strings.Count(createSQL, want) != 2 { // 普通索引 + 唯一键各一次
-		t.Errorf("普通索引与唯一键都应带前缀 %q: %s", want, createSQL)
-	}
+	t.Run("ordinary index on non-key string keeps prefix", func(t *testing.T) {
+		pdb := NewDB()
+		pdb.RegisterTable(msg, WithIndexes("ip"))
+		createSQL := pdb.GetCreateTableSQL(msg)
+		if strings.Contains(createSQL, "(`ip`)") {
+			t.Errorf("TEXT 列索引不能是裸列名（MySQL Error 1170）: %s", createSQL)
+		}
+		want := fmt.Sprintf("(`ip`(%d))", TextIndexPrefixLength)
+		if !strings.Contains(createSQL, "`ip` MEDIUMTEXT") || !strings.Contains(createSQL, want) {
+			t.Errorf("不在主键/唯一键里的 string 仍是 MEDIUMTEXT，普通索引应带前缀 %q: %s", want, createSQL)
+		}
+	})
+
+	t.Run("key column is indexed whole in every index", func(t *testing.T) {
+		pdb := NewDB()
+		pdb.RegisterTable(msg, WithIndexes("ip"), WithUniqueKey("ip"))
+		createSQL := pdb.GetCreateTableSQL(msg)
+		if !strings.Contains(createSQL, "`ip` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''") {
+			t.Errorf("唯一键里的 string 应映射为 VARCHAR 键列: %s", createSQL)
+		}
+		if strings.Contains(createSQL, "`ip`(") {
+			t.Errorf("键列在任何索引里都不能带前缀: %s", createSQL)
+		}
+		if strings.Count(createSQL, "(`ip`)") != 2 { // 普通索引 + 唯一键各一次
+			t.Errorf("普通索引与唯一键都应建在整列上: %s", createSQL)
+		}
+	})
 
 	// 非 TEXT 列不补前缀
 	pdb2 := NewDB()

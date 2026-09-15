@@ -282,3 +282,83 @@ err = db.DumpMigrationSQLFile("migrations/0007_add_addr.sql", &pb.Player{}, &pb.
 - [ ] 代码里没有用 `GetReplaceSQLWithArgs` / `GetBatchReplaceSQLWithArgs`（见 [api-safety.md](api-safety.md)）
 - [ ] 开了缓存的话，`ttl` 是有限值，不是永不过期（见 [cache.md](cache.md)）
 - [ ] DDL 只由一个进程执行（migrator / 迁移 Job），或至少确认锁生效
+- [ ] 主键/唯一键里有 string/bytes 的旧表已按下面第七节迁移，并且确认不会再回滚到旧版本（不可降级）
+
+<a id="legacy-key-columns"></a>
+
+## 七、主键/唯一键里 string/bytes 列的旧形态迁移
+
+主键/唯一键里的 `string` / `bytes` 映射成 `VARCHAR(N) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''` /
+`VARBINARY(N) NOT NULL DEFAULT ''` 整列索引。线上如果还是下面这些形态，同步（`SyncAllTables` /
+`UpdateTableField` / `GenerateMigrationSQL` / GORM 的 `CreateOrUpdateTable`）返回
+`ErrSchemaDrift` + `ErrLegacyKeyColumn`（两个都能 `errors.Is`），**本次不执行任何 DDL**：
+
+| 线上形态 | 通常从哪来 | 问题 |
+|---|---|---|
+| `MEDIUMTEXT` 可空 + `UNIQUE (col(191))` | 旧版本本库给唯一键里的 string 建的 | 唯一性只覆盖前 191 个字符 |
+| `MEDIUMBLOB` + 前缀唯一索引 | 旧版本本库给唯一键里的 bytes 建的 | 唯一性只覆盖前 191 个字节 |
+| `VARCHAR` + `utf8mb4_unicode_ci` 等 `*_ci` | 手工建表、别的工具 | 不区分大小写：`'AbC'` 与 `'abc'` 撞键 |
+| `VARCHAR` + `utf8mb4_bin` | 手工建表 | PAD SPACE：`'abc'` 与 `'abc '` 撞键 |
+
+**为什么不自动迁移**：要先处理 NULL（多行 NULL 改成 `''` 后会互相撞唯一键）、确认没有超长值、
+删掉前缀索引再按整列重建，TiDB 聚簇主键还根本不允许原地改——这些都得先看过数据再做，
+而且在滚动发布下自动执行会被新旧副本来回翻面。
+
+错误信息里带着逐列原因、步骤和**按实际表名、列名、索引名填好的 SQL**，只有下面两种形态，
+都已在 MySQL 与 TiDB v8.5 上实测可以执行（见 `string_key_integration_test.go`，
+测试直接执行从错误信息里取出的 SQL，再同步验证零漂移）。
+
+### 预检（两种形态都要做）
+
+```sql
+SELECT COUNT(*) FROM `t` WHERE `col` IS NULL;   -- 多于 1 行时，先人工给它们赋唯一值或删除；也不能与已有的 '' 撞
+SELECT MAX(CHAR_LENGTH(`col`)) FROM `t`;        -- string 列须 ≤ N；bytes 列用 MAX(LENGTH(`col`))
+```
+
+从前缀唯一 / `*_ci` / PAD SPACE 换成整列、区分大小写、NO PAD，唯一性只会变宽松，已有数据不会因此出现新的重复；
+会撞键的只有 NULL 改写成 `''` 这一步。
+
+### 形态一：旧形态列只在唯一键/普通索引里——原地 ALTER
+
+必须拆成独立语句：TiDB 不允许在同一条 ALTER 里 DROP 后复用同一个索引名（Error 1061），
+也不允许给仍带索引的列改排序规则（Error 8200）；前缀索引也不会随 MODIFY 自动变成整列索引。
+
+```sql
+ALTER TABLE `account` DROP INDEX `uk_account`;
+UPDATE `account` SET `provider_id` = '' WHERE `provider_id` IS NULL;
+ALTER TABLE `account` MODIFY COLUMN `provider_id` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:3';
+ALTER TABLE `account` ADD UNIQUE KEY `uk_account` (`provider_id`);
+```
+
+- 删索引到重建索引之间唯一性不受约束，请停写或在维护窗口执行。
+- 线上若另有包含该列、但不是本库声明的索引（错误信息会点名），TiDB 上也要先删掉才能 MODIFY，迁移后按需手工重建。
+
+### 形态二：旧形态列在主键里——影子表重建
+
+TiDB 聚簇主键既不能 `DROP PRIMARY KEY`，也不能改带索引列的排序规则（先 `CREATE TABLE ... LIKE`
+建空表再 MODIFY 也一样是 Error 8200），所以按影子表重建，MySQL 与 TiDB 通用：
+
+```sql
+CREATE TABLE `account__p2m_new` (`provider_id` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:1', `note` MEDIUMTEXT COMMENT 'pb:2', PRIMARY KEY (`provider_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='account';
+INSERT INTO `account__p2m_new` (`provider_id`, `note`) SELECT `provider_id`, `note` FROM `account`;
+RENAME TABLE `account` TO `account__p2m_old`, `account__p2m_new` TO `account`;
+-- 核对数据无误后再手工 DROP TABLE `account__p2m_old`（本库不会替你删）
+```
+
+- 建表语句就是本库为这张表生成的那条，只换了表名；索引名保持原表的 `idx_<表名>_N` / `uk_<表名>`，
+  RENAME 回来之后同步才认得出这些索引。
+- 影子表只含 proto 当前声明的列；线上多出来的列（错误信息会点名）要在执行前手工补进建表语句和 INSERT 列表，
+  否则它们的数据只留在旧表里。
+- 可空的旧形态列在 SELECT 里会写成 `COALESCE(col, '')`。
+- TiDB 单个事务有大小上限，大表请分批拷贝。
+- 只在 MySQL 上、且只是排序规则不对（例如 `varchar(191) utf8mb4_unicode_ci` 主键）时，
+  直接 `ALTER TABLE ... MODIFY COLUMN ... COLLATE utf8mb4_0900_bin` 也能原地完成（实测 MySQL 通过、TiDB 报 8200）。
+
+迁移完成后再同步应当零漂移、零 ALTER。
+
+### 不可降级
+
+迁移后（以及新版本新建的表）键列是 `VARCHAR/VARBINARY`；旧版本进程同步时会按它自己的期望
+（`MEDIUMTEXT` + 191 前缀）报 `ErrSchemaDrift`。含字符串键的表一旦迁移，就不能再回滚到旧版本的库。
+另外，给已有多行数据的表**新增**非空 string 唯一键列时，旧行在新列上全是 `''`，补唯一键会撞 1062，
+需要先回填再加键（与新增数值唯一键列同类）。

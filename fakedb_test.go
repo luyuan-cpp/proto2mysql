@@ -184,9 +184,10 @@ func row(vals ...driver.Value) []driver.Value      { return vals }
 // colRow 造一行 information_schema.COLUMNS 的结果：(列名, 列类型, 列注释)
 // colRow 一行 information_schema.COLUMNS 快照。
 // 列序必须与 getTableColumnMeta 的 SELECT 一致：
-// COLUMN_NAME, COLUMN_TYPE, COLUMN_COMMENT, IS_NULLABLE, COLUMN_DEFAULT, EXTRA。
+// COLUMN_NAME, COLUMN_TYPE, COLUMN_COMMENT, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLLATION_NAME。
 // colRow 用于本仓库 GolangTest 的对齐快照：数值列是 NOT NULL DEFAULT 0，TEXT/BLOB
-// 可空，pb:1 的 id 是无默认值的 AUTO_INCREMENT。要造漂移用 colRowAttrsDefault。
+// 可空，pb:1 的 id 是无默认值的 AUTO_INCREMENT；varchar/varbinary 按键列形态给
+// NOT NULL、默认值空串与 KeyStringCollation。要造漂移用 colRowAttrsDefault / colRowFull。
 func colRow(name, colType string, fieldNum int) []driver.Value {
 	nullable := fakeColumnIsNullable(colType)
 	extra := ""
@@ -204,6 +205,12 @@ func colRowAttrs(name, colType string, fieldNum int, nullable bool, extra string
 
 // colRowAttrsDefault 还能显式指定 COLUMN_DEFAULT；nil 表示 information_schema 返回 SQL NULL。
 func colRowAttrsDefault(name, colType string, fieldNum int, nullable bool, extra string, defaultValue driver.Value) []driver.Value {
+	return colRowFull(name, colType, fieldNum, nullable, extra, defaultValue, fakeColumnCollation(colType))
+}
+
+// colRowFull 在 colRowAttrsDefault 之上再显式指定 COLLATION_NAME；nil 表示非字符列的 SQL NULL。
+// 旧形态键列（varchar + utf8mb4_unicode_ci 等）的快照只能用它造。
+func colRowFull(name, colType string, fieldNum int, nullable bool, extra string, defaultValue, collation driver.Value) []driver.Value {
 	comment := ""
 	if fieldNum > 0 {
 		comment = fmt.Sprintf("pb:%d", fieldNum)
@@ -212,7 +219,7 @@ func colRowAttrsDefault(name, colType string, fieldNum int, nullable bool, extra
 	if nullable {
 		isNullable = "YES"
 	}
-	return row(name, colType, comment, isNullable, defaultValue, extra)
+	return row(name, colType, comment, isNullable, defaultValue, extra, collation)
 }
 
 func fakeColumnIsNullable(colType string) bool {
@@ -230,6 +237,25 @@ func fakeColumnDefault(colType, extra string) driver.Value {
 		strings.HasPrefix(base, "bigint") || strings.HasPrefix(base, "float") ||
 		strings.HasPrefix(base, "double") {
 		return "0"
+	}
+	// 本库只为主键/唯一键 string/bytes 列生成 varchar/varbinary，形态固定 NOT NULL DEFAULT ''；
+	// MySQL 与 TiDB 回读的 COLUMN_DEFAULT 都是空串而不是 NULL。
+	if strings.HasPrefix(base, "varchar") || strings.HasPrefix(base, "varbinary") {
+		return ""
+	}
+	return nil
+}
+
+// fakeColumnCollation 按真实 information_schema 的口径给 COLLATION_NAME：
+// 本库的 varchar 键列显式带 KeyStringCollation，TEXT 列继承表默认的 utf8mb4_unicode_ci，
+// 数值/二进制/时间列为 NULL。
+func fakeColumnCollation(colType string) driver.Value {
+	base := strings.ToLower(strings.Fields(colType)[0])
+	switch {
+	case strings.HasPrefix(base, "varchar"), strings.HasPrefix(base, "char"):
+		return KeyStringCollation
+	case strings.Contains(base, "text"):
+		return "utf8mb4_unicode_ci"
 	}
 	return nil
 }

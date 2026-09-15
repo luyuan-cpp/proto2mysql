@@ -105,7 +105,7 @@ func TestEmitParityCorpus(t *testing.T) {
 		t.Skip("跳过对拍语料发射：设置 PARITY_OUT=<文件> 以启用")
 	}
 
-	corpus := parityCorpus{CorpusVersion: 1, Lang: "go"}
+	corpus := parityCorpus{CorpusVersion: 2, Lang: "go"}
 	add := func(name, sql string, args []interface{}) {
 		corpus.Cases = append(corpus.Cases, parityCase{Name: name, SQL: sql, Args: parityArgs(args)})
 	}
@@ -141,6 +141,23 @@ func TestEmitParityCorpus(t *testing.T) {
 			WithIndexes("player_id,group_id"), WithUniqueKey("ip")).CreateTable(), nil)
 	add("ddl/create/nullable",
 		NewSQLBuilder(&testpb.GolangTest{}, WithPrimaryKey("id"), WithNullableFields("port")).CreateTable(), nil)
+
+	// 主键/唯一键里的 string/bytes 映射成 VARCHAR（utf8mb4_0900_bin）/VARBINARY 整列索引（语料 v2）。
+	// CreateTable 校验失败只返回空串，不拦的话一条空 SQL 会被当成正常用例写进语料。
+	addDDL := func(name, sql string) {
+		if sql == "" {
+			t.Fatalf("%s: 表选项校验失败，没有产出建表语句", name)
+		}
+		add(name, sql, nil)
+	}
+	addDDL("ddl/create/string_pk",
+		NewSQLBuilder(&testpb.GolangTest{}, WithPrimaryKey("ip"), WithAutoIncrementKey("")).CreateTable())
+	addDDL("ddl/create/string_pk_max_length",
+		NewSQLBuilder(&testpb.GolangTest{}, WithPrimaryKey("ip"), WithAutoIncrementKey(""),
+			WithMaxLength("ip", 255)).CreateTable())
+	addDDL("ddl/create/bytes_unique",
+		NewSQLBuilder(parityKeyProbeMessage(t), WithTableName("bytes_key_probe"),
+			WithPrimaryKey("id"), WithUniqueKey("provider,token")).CreateTable())
 
 	// ── schema.sql 的**文件级顺序**（曾经的真实分叉）─────────────────────
 	//

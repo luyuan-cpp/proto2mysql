@@ -173,18 +173,30 @@ message Player {
 
 ## 八、索引的两个坑
 
-**1. TEXT/BLOB 列上的索引必须带前缀长度。**
+**1. 主键/唯一键里的 string/bytes 建整列索引；其余 TEXT/BLOB 上的索引带前缀长度。**
 
-MySQL 不允许对 TEXT/BLOB 列建不带长度的索引（Error 1170）。
-而本库把 `string` 映射成 `MEDIUMTEXT`，所以只要你在 string 列上声明了
-`index` / `unique_key`，库会自动补 `(191)`：
+MySQL 不允许对 TEXT/BLOB 列建不带长度的索引（Error 1170）。本库把普通的 `string` 映射成 `MEDIUMTEXT`，
+所以在**不属于主键/唯一键**的 string 列上声明 `index` 时，库会自动补 `(191)`：
 
 ```sql
-UNIQUE KEY `uk_player` (`nickname`(191))
+INDEX `idx_player_0` (`nickname`(191))
 ```
 
-191 是 utf8mb4 下的经典安全值。**注意这意味着唯一性只覆盖前 191 个字符**——
-库会打一条告警提醒你。
+前缀索引只覆盖前 191 个字符，拿来保证唯一性等于没有唯一性。所以**放进主键或唯一键**的
+string/bytes 不走前缀：它们映射成 `VARCHAR(N) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''` /
+`VARBINARY(N) NOT NULL DEFAULT ''`，在任何索引里都建整列（N 默认 191，用 `max_length` 调整）：
+
+```sql
+`provider_id` VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '',
+UNIQUE KEY `uk_account` (`provider`,`provider_id`)
+```
+
+- 排序规则必须是 `utf8mb4_0900_bin`：`*_ci` 不区分大小写（`'AbC'` 与 `'abc'` 撞键），
+  `utf8mb4_bin` 是 PAD SPACE（`'abc'` 与 `'abc '` 撞键）。
+- 写入前超长或非法 UTF-8 返回 `ErrInvalidKeyValue`，不会被截断成另一个键，也不会发出任何 SQL。
+- 单个索引合计不超过 3072 字节，超出时建表前报错并列出每列占用。
+- 线上还是旧形态（`MEDIUMTEXT` + `(191)`、`*_ci`、`utf8mb4_bin`）时同步返回 `ErrLegacyKeyColumn`，
+  迁移方法见 [schema-evolution.md](schema-evolution.md#legacy-key-columns)。
 
 **2. 索引现在会自动补齐（新行为）。**
 

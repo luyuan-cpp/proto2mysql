@@ -327,9 +327,9 @@ func TestSyncBackfillsMissingIndexes(t *testing.T) {
 		WithPrimaryKey("id"), WithIndexes("player_id"), WithUniqueKey("ip"))
 
 	queueLockedSchemaSync(conn,
-		rows(row(int64(1))),     // 表存在
-		golangTestAlignedCols(), // 列已对齐
-		nil,                     // 既有索引：一个都没有
+		rows(row(int64(1))),              // 表存在
+		golangTestAlignedColsWithIPKey(), // 列已对齐（ip 在唯一键里，线上已是键列形态）
+		nil,                              // 既有索引：一个都没有
 		rows(indexRow("PRIMARY", true, 1, "id", nil)), // 主键就是 id
 		nil, // ALTER 自身
 	)
@@ -344,10 +344,18 @@ func TestSyncBackfillsMissingIndexes(t *testing.T) {
 	if !strings.Contains(alter, "ADD INDEX `idx_golang_test_0` (`player_id`)") {
 		t.Errorf("应补普通索引: %s", alter)
 	}
-	// ip 是 MEDIUMTEXT，索引必须带前缀长度，否则 MySQL 报 Error 1170
-	if !strings.Contains(alter, "ADD UNIQUE KEY `uk_golang_test` (`ip`(191))") {
-		t.Errorf("应补唯一键且带前缀长度: %s", alter)
+	// ip 在唯一键里映射成 VARCHAR(191) 整列：补的唯一键必须覆盖整个值，带前缀就只保证前 191 个字符唯一
+	if !strings.Contains(alter, "ADD UNIQUE KEY `uk_golang_test` (`ip`)") {
+		t.Errorf("应按整列补唯一键: %s", alter)
 	}
+}
+
+// golangTestAlignedColsWithIPKey ip 声明在主键/唯一键里时与 GolangTest 对齐的快照：
+// ip 是 varchar(191) NOT NULL、默认值空串、KeyStringCollation 的键列形态。
+func golangTestAlignedColsWithIPKey() [][]driver.Value {
+	cols := golangTestAlignedCols()
+	cols[1] = colRow("ip", "varchar(191)", 2)
+	return cols
 }
 
 // TestSyncSkipsSecondaryIndexQueryWhenNoneDeclared proto 里没声明二级索引时不必读取它们；

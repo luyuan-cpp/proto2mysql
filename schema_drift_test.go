@@ -287,35 +287,50 @@ func TestSchemaDriftIndexDefinitionFailsClosed(t *testing.T) {
 	tests := []struct {
 		name      string
 		opts      []TableOption
+		cols      [][]driver.Value
 		indexRows [][]driver.Value
+		wantDrift string
 	}{
 		{
 			name:      "ordinary index is unexpectedly unique",
 			opts:      []TableOption{WithIndexes("player_id")},
+			cols:      golangTestAlignedCols(),
 			indexRows: rows(indexRow("idx_golang_test_0", true, 1, "player_id", nil)),
+			wantDrift: "index idx_golang_test_0 definition mismatch",
 		},
 		{
+			// ip 只在普通索引里，不是键列：仍是 MEDIUMTEXT，索引必须带 191 前缀
 			name:      "ordinary text index has no prefix",
 			opts:      []TableOption{WithIndexes("ip")},
+			cols:      golangTestAlignedCols(),
 			indexRows: rows(indexRow("idx_golang_test_0", false, 1, "ip", nil)),
+			wantDrift: "index idx_golang_test_0 definition mismatch",
 		},
 		{
+			// 下面两条 ip 在唯一键里，列快照已是对齐的键列形态（varchar(191) NOT NULL DEFAULT '' +
+			// KeyStringCollation），错的只有索引本身：报出来的必须是索引漂移，而不是 nullable/default
 			name:      "declared unique index is ordinary",
 			opts:      []TableOption{WithUniqueKey("ip")},
-			indexRows: rows(indexRow("uk_golang_test", false, 1, "ip", int64(TextIndexPrefixLength))),
+			cols:      golangTestAlignedColsWithIPKey(),
+			indexRows: rows(indexRow("uk_golang_test", false, 1, "ip", nil)),
+			wantDrift: "unique index uk_golang_test definition mismatch",
 		},
 		{
-			name:      "unique text prefix length differs",
+			name:      "unique key column still has a prefix",
 			opts:      []TableOption{WithUniqueKey("ip")},
-			indexRows: rows(indexRow("uk_golang_test", true, 1, "ip", int64(100))),
+			cols:      golangTestAlignedColsWithIPKey(),
+			indexRows: rows(indexRow("uk_golang_test", true, 1, "ip", int64(TextIndexPrefixLength))),
+			wantDrift: "unique index uk_golang_test definition mismatch",
 		},
 		{
 			name: "composite index order differs",
 			opts: []TableOption{WithIndexes("player_id,port")},
+			cols: golangTestAlignedCols(),
 			indexRows: rows(
 				indexRow("idx_golang_test_0", false, 1, "port", nil),
 				indexRow("idx_golang_test_0", false, 2, "player_id", nil),
 			),
+			wantDrift: "index idx_golang_test_0 definition mismatch",
 		},
 	}
 
@@ -331,14 +346,18 @@ func TestSchemaDriftIndexDefinitionFailsClosed(t *testing.T) {
 
 			queueLockedSchemaSync(conn,
 				rows(row(int64(1))),
-				golangTestAlignedCols(),
+				tc.cols,
 				tc.indexRows,
 				rows(indexRow("PRIMARY", true, 1, "id", nil)),
 			)
 
 			err := pdb.CreateOrUpdateTable(&testpb.GolangTest{})
-			if !errors.Is(err, ErrSchemaDrift) {
-				t.Fatalf("index definition drift must return ErrSchemaDrift, got %v", err)
+			if !errors.Is(err, ErrSchemaDrift) || !strings.Contains(err.Error(), tc.wantDrift) {
+				t.Fatalf("index definition drift must return ErrSchemaDrift naming %q, got %v", tc.wantDrift, err)
+			}
+			if errors.Is(err, ErrLegacyKeyColumn) ||
+				strings.Contains(err.Error(), "nullable mismatch") || strings.Contains(err.Error(), "default mismatch") {
+				t.Fatalf("aligned column snapshot must only report the index drift, got %v", err)
 			}
 			if conn.countSQL("ALTER TABLE") != 0 {
 				t.Fatalf("same-name drift must not be auto-rebuilt, SQL: %v", conn.sqls())

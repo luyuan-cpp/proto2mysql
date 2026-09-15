@@ -42,13 +42,13 @@ func SerializeFieldValue(message proto.Message, fieldDesc protoreflect.FieldDesc
 // ⚠️ 生成SQL参数请用SerializeFieldValue：本函数无法表达SQL NULL，
 // 未设置的Timestamp会得到空串，直接下发会被MySQL拒绝。
 //
-// 二进制字段不做Base64：目标列是MEDIUMBLOB，本身二进制安全，编码只会白白多占33%体积
+// 二进制字段不做Base64：目标列是MEDIUMBLOB/VARBINARY，本身二进制安全，编码只会白白多占33%体积
 // 并在每次读写上加一次编解码。Go的string可承载任意字节，驱动以参数下发时逐字节无损，
 // 因此返回类型仍是string。要在SQL控制台查看，用MySQL自带的TO_BASE64(列)。
 //
-// ⚠️ 这些字段对应的列必须是二进制类型（BLOB系）。写进utf8mb4的TEXT/VARCHAR列会因
-// 非法UTF-8被拒或损坏——本库建表时bytes/message/map/list统一映射为MEDIUMBLOB，
-// 只有手工建的表才可能踩到。
+// ⚠️ 这些字段对应的列必须是二进制类型。写进utf8mb4的TEXT/VARCHAR列会因非法UTF-8被拒或损坏——
+// 本库建表时message/map/list映射为MEDIUMBLOB，bytes映射为MEDIUMBLOB（在主键/唯一键里时为
+// VARBINARY），只有手工建的表才可能踩到。
 func SerializeFieldAsString(message proto.Message, fieldDesc protoreflect.FieldDescriptor) (string, error) {
 	if err := rejectRealOneof(fieldDesc); err != nil {
 		return "", err

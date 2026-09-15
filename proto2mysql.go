@@ -79,6 +79,23 @@ var (
 	// 早先这些类型静默回落成 TEXT：建表一路成功，跑到**第一次写入**才抛错，
 	// 而那时列已经建出来了、可能还上了线。现在在生成 DDL 时就 fail-fast。
 	ErrUnsupportedFieldKind = errors.New("field kind has no MySQL type mapping")
+
+	// ErrInvalidKeyValue 主键/唯一键里 string/bytes 列的值放不进目标列：超过 max_length，
+	// 或 string 不是合法 UTF-8。
+	//
+	// 必须在发出任何 SQL 之前拦下：严格模式下 MySQL 报 1406/1366，而非严格模式会把超长值
+	// **静默截断**——两个只在尾部不同的第三方 ID 截断后落成同一个键，要么撞 1062，要么被当成
+	// 同一个账号。WHERE 主键条件和缓存 key 用的也是这份值，超长主键在库里本就不可能存在。
+	ErrInvalidKeyValue = errors.New("invalid key column value")
+
+	// ErrLegacyKeyColumn 线上主键/唯一键里的 string/bytes 列不是 VARCHAR（utf8mb4_0900_bin）/
+	// VARBINARY 形态，与写入路径的唯一性语义不一致。总是与 ErrSchemaDrift 一起返回。
+	//
+	// MEDIUMTEXT/MEDIUMBLOB 前缀索引只保证前 191 个字符/字节唯一；*_ci 排序规则把 'AbC' 与 'abc'
+	// 判为同一个键；utf8mb4_bin 等 PAD SPACE 规则把 'abc' 与 'abc ' 判为同一个键。
+	// 不自动迁移：需要先处理 NULL 与可能的重复、重建索引，TiDB 聚簇主键还不允许原地修改，
+	// 这些都必须由人确认数据后执行。
+	ErrLegacyKeyColumn = errors.New("legacy string/bytes key column")
 )
 
 // SqlWithArgs 存储带?占位符的SQL和对应的参数列表
@@ -97,6 +114,8 @@ type MessageTable struct {
 	uniqueKeys      string   // 唯一键（逗号分隔字段）
 	autoIncreaseKey string   // 自增字段名
 	nullableFields  []string // 允许为NULL的字段
+	// maxLengths 主键/唯一键里 string/bytes 字段的列宽（max_length 选项），未声明的字段取 DefaultKeyColumnLength
+	maxLengths map[string]uint32
 
 	// TiDB 方言选项：以 /*T!*/ 扩展注释形式进入 DDL，MySQL 视为普通注释忽略，
 	// 同一份建表语句在 MySQL 与 TiDB 上均可执行（详见 proto/proto2mysql_option.proto 注释）
@@ -132,6 +151,44 @@ func (m *MessageTable) isAutoIncrementField(fieldName string) bool {
 	return m.autoIncreaseKey == fieldName
 }
 
+// isKeyColumnName 字段是否出现在主键或唯一键里。唯一键必须与建表处同样按逗号拆分并 TrimSpace，
+// 否则 "provider, provider_id" 这种带空格的声明会让列类型与建出来的唯一键对不上。
+func (m *MessageTable) isKeyColumnName(name string) bool {
+	if slices.Contains(m.primaryKey, name) {
+		return true
+	}
+	if m.uniqueKeys == "" {
+		return false
+	}
+	for _, col := range strings.Split(m.uniqueKeys, ",") {
+		if strings.TrimSpace(col) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// keyColumnKind 字段是主键/唯一键里的非 list/map string 或 bytes 时返回其 Kind。
+// 列类型是列的属性：这类列在任何索引里（包括普通索引）都是 VARCHAR/VARBINARY 整列。
+func (m *MessageTable) keyColumnKind(fieldDesc protoreflect.FieldDescriptor) (protoreflect.Kind, bool) {
+	if fieldDesc == nil || fieldDesc.IsList() || fieldDesc.IsMap() {
+		return 0, false
+	}
+	kind := fieldDesc.Kind()
+	if kind != protoreflect.StringKind && kind != protoreflect.BytesKind {
+		return 0, false
+	}
+	return kind, m.isKeyColumnName(string(fieldDesc.Name()))
+}
+
+// keyColumnLength 键列的 N：string 按字符、bytes 按字节。
+func (m *MessageTable) keyColumnLength(fieldName string) uint32 {
+	if n, ok := m.maxLengths[fieldName]; ok {
+		return n
+	}
+	return DefaultKeyColumnLength
+}
+
 func buildPlaceholders(count int) string {
 	if count <= 0 {
 		return ""
@@ -154,6 +211,19 @@ func (m *MessageTable) getMySQLFieldType(fieldDesc protoreflect.FieldDescriptor)
 
 	if fieldDesc.IsMap() || fieldDesc.IsList() {
 		return "MEDIUMBLOB" // 集合类型统一用MEDIUMBLOB
+	}
+
+	// 主键/唯一键里的 string/bytes 必须建整列索引：MEDIUMTEXT/MEDIUMBLOB 只能建 191 前缀索引，
+	// 唯一性只覆盖前 191 个字符/字节。string 用 KeyStringCollation（区分大小写、NO PAD），
+	// 否则 'AbC'/'abc'、'abc'/'abc ' 会被判为同一个键。
+	// 固定 NOT NULL DEFAULT ''：写入路径从不给 string/bytes 写 NULL，未赋值一律是 ''。
+	// 刻意不查 MySQLFieldTypes：那是可被调用方改写的全局表，键列类型不能跟着漂移。
+	if kind, ok := m.keyColumnKind(fieldDesc); ok {
+		length := m.keyColumnLength(string(fieldDesc.Name()))
+		if kind == protoreflect.StringKind {
+			return fmt.Sprintf("VARCHAR(%d) CHARACTER SET utf8mb4 COLLATE %s NOT NULL DEFAULT ''", length, KeyStringCollation)
+		}
+		return fmt.Sprintf("VARBINARY(%d) NOT NULL DEFAULT ''", length)
 	}
 
 	fieldName := string(fieldDesc.Name())
@@ -487,8 +557,8 @@ func isTypeMatch(currentType, targetType string) bool {
 
 	// 同一基础类型，再比长度/精度/符号。口径同上：线上装得下目标就不动它。
 	switch currentBase {
-	case "varchar", "char":
-		// 线上更宽时不动它（收窄会截断已有数据）。
+	case "varchar", "char", "varbinary", "binary":
+		// 线上更宽时不动它（收窄会截断已有数据）；更窄时必须拓宽，否则调大 max_length 的键列写入报 1406。
 		return current.length >= target.length
 	case "tinyint", "smallint", "mediumint", "int", "bigint":
 		// 位宽相同，只剩有无符号要比。
@@ -588,8 +658,9 @@ func escapeMySQLName(name string) string {
 //
 // MySQL **不允许**对 TEXT/BLOB 列建不带前缀长度的索引，直接报
 // Error 1170 BLOB/TEXT column used in key specification without a key length。
-// 而本库把 string 映射成 MEDIUMTEXT，所以只要在 string 列上声明了 index / unique_key，
-// 不补前缀产出的就是一条 MySQL 会拒绝执行的 DDL。
+// 而本库把不在主键/唯一键里的 string 映射成 MEDIUMTEXT（repeated/map/message 映射成 MEDIUMBLOB），
+// 只要在这类列上声明了索引，不补前缀产出的就是一条 MySQL 会拒绝执行的 DDL。
+// 主键/唯一键里的标量 string/bytes 是 VARCHAR/VARBINARY 键列，建整列索引，不用前缀。
 //
 // 这个洞长期没暴露，是因为测试只比对 SQL 字符串、从不真的执行：拿本仓库自带的
 // tools/proto2sql/testdata/account.proto 生成建表语句打到 MySQL 8.4 上就是 Error 1170。
@@ -597,6 +668,28 @@ func escapeMySQLName(name string) string {
 // 191 是 utf8mb4 下的经典安全值（旧的 767 字节索引上限 ÷ 4）。
 // 设为 0 表示不补前缀——产出的 DDL 建不了表，只在做历史输出比对时才有意义。
 const TextIndexPrefixLength = 191
+
+// 主键/唯一键里 string/bytes 列（VARCHAR/VARBINARY 整列索引）的长度与排序规则约束。
+const (
+	// DefaultKeyColumnLength 未声明 max_length 时键列的 N（string 按字符、bytes 按字节）。
+	// 与 TextIndexPrefixLength 同为 191：旧的 767 字节索引上限 ÷ utf8mb4 的 4 字节，
+	// 三个默认长度的 string 列组成的联合键（2292 字节）仍在 MaxIndexKeyBytes 之内。
+	DefaultKeyColumnLength = 191
+	// MaxKeyStringLength string 键列 max_length 的上限（字符）：MaxIndexKeyBytes ÷ utf8mb4 每字符 4 字节。
+	// 实测单列 VARCHAR(768) utf8mb4 可做主键，VARCHAR(769) 报 Error 1071。
+	MaxKeyStringLength = 768
+	// MaxKeyBytesLength bytes 键列 max_length 的上限（字节）：VARBINARY 每字节计 1，等于 MaxIndexKeyBytes。
+	MaxKeyBytesLength = 3072
+	// MaxIndexKeyBytes 单个索引（主键、唯一键、每个普通索引各自计算）所有列合计的字节上限。
+	// InnoDB DYNAMIC/COMPRESSED 行格式超出报 Error 1071（实测 VARCHAR(500)+VARCHAR(500) 联合主键即报）；
+	// TiDB 的 max-index-length 默认同为 3072。
+	MaxIndexKeyBytes = 3072
+	// KeyStringCollation string 键列的排序规则：按码点比较、区分大小写、NO PAD（尾部空格参与比较）。
+	// 第三方账号 ID（如 Google sub）区分大小写且须逐字符精确匹配：utf8mb4_unicode_ci 会把 'AbC' 与 'abc'
+	// 判为重复，utf8mb4_bin 是 PAD SPACE、会把 'abc' 与 'abc ' 判为重复。
+	// MySQL 8.0.17 起提供；TiDB 需要新排序规则框架（new_collations_enabled_on_first_bootstrap，新集群默认开启）。
+	KeyStringCollation = "utf8mb4_0900_bin"
+)
 
 // validateFieldKinds 检查这个 message 能不能安全地映射成一张表，不能就 fail-fast。
 //
@@ -728,7 +821,8 @@ func (m *MessageTable) validateTableOptions() error {
 			}
 			if m.needsIndexPrefix(name) {
 				return fmt.Errorf("%w: 表 %s 的主键字段 %q 映射为 %s，只能建立前缀索引，"+
-					"不能保证完整主键唯一性；请改用整数/枚举等可完整索引的标量字段",
+					"不能保证完整主键唯一性。标量 string/bytes 主键会映射为 VARCHAR/VARBINARY 整列索引，"+
+					"但 repeated/map/message 这类整体序列化进 BLOB 的字段不行；请改用整数/枚举或标量 string/bytes 字段",
 					ErrInvalidTableOption, m.tableName, name, targetType)
 			}
 			if !strings.Contains(strings.ToUpper(targetType), "NOT NULL") {
@@ -751,13 +845,26 @@ func (m *MessageTable) validateTableOptions() error {
 		}
 	}
 	for _, name := range m.nullableFields {
-		if _, err := lookup("nullable", name); err != nil {
+		field, err := lookup("nullable", name)
+		if err != nil {
 			return err
+		}
+		if kind, ok := m.keyColumnKind(field); ok {
+			return fmt.Errorf("%w: 表 %s 的 %s 字段 %q 在主键/唯一键里，不能声明 nullable："+
+				"写入路径从不为 string/bytes 写 NULL（未赋值一律写 ''），nullable 无法让未赋值的行不参与唯一性，"+
+				"只会让列定义与写入语义不一致",
+				ErrInvalidTableOption, m.tableName, kind, name)
 		}
 		if slices.Contains(m.primaryKey, name) {
 			return fmt.Errorf("%w: 表 %s 的主键字段 %q 不能同时声明 nullable",
 				ErrInvalidTableOption, m.tableName, name)
 		}
+	}
+	if err := m.validateMaxLengths(lookup); err != nil {
+		return err
+	}
+	if err := m.validateIndexKeyBytes(); err != nil {
+		return err
 	}
 
 	if m.autoIncreaseKey == "" {
@@ -1042,7 +1149,8 @@ type columnMeta struct {
 	nullable         bool           // IS_NULLABLE = 'YES'
 	defaultValue     sql.NullString // COLUMN_DEFAULT；Valid=false 表示 SQL NULL
 	extra            string         // EXTRA（小写），含 "auto_increment" 时该列是自增列
-	metadataComplete bool           // nullable/default/extra 都来自真实元数据时才校验属性漂移
+	collation        string         // COLLATION_NAME；非字符列（数值/二进制/时间）为空串
+	metadataComplete bool           // nullable/default/extra/collation 都来自真实元数据时才校验属性漂移
 }
 
 // isAutoIncrement 线上这一列当前带不带 AUTO_INCREMENT。
@@ -1130,7 +1238,7 @@ func (p *DB) getTableColumnMeta(tableName string) (map[string]columnMeta, error)
 	}
 
 	query := `
-		SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_COMMENT, IS_NULLABLE, COLUMN_DEFAULT, EXTRA
+		SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_COMMENT, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLLATION_NAME
 		FROM INFORMATION_SCHEMA.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 	`
@@ -1143,8 +1251,8 @@ func (p *DB) getTableColumnMeta(tableName string) (map[string]columnMeta, error)
 	metas := make(map[string]columnMeta)
 	for rows.Next() {
 		var colName, colType, colComment, isNullable, extra string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&colName, &colType, &colComment, &isNullable, &defaultValue, &extra); err != nil {
+		var defaultValue, collation sql.NullString
+		if err := rows.Scan(&colName, &colType, &colComment, &isNullable, &defaultValue, &extra, &collation); err != nil {
 			return nil, fmt.Errorf("scan column meta for table %s: %w", tableName, err)
 		}
 		meta := columnMeta{
@@ -1152,6 +1260,7 @@ func (p *DB) getTableColumnMeta(tableName string) (map[string]columnMeta, error)
 			nullable:         strings.EqualFold(isNullable, "YES"),
 			defaultValue:     defaultValue,
 			extra:            strings.ToLower(extra),
+			collation:        collation.String,
 			metadataComplete: true,
 		}
 		if num, ok := parseFieldNumFromComment(colComment); ok {
@@ -1460,7 +1569,7 @@ func narrowingSuppressed(currentType, targetType string) bool {
 	}
 
 	switch currentBase {
-	case "varchar", "char", "datetime":
+	case "varchar", "char", "varbinary", "binary", "datetime":
 		return current.length > target.length
 	case "float", "double":
 		return current.decimal > target.decimal
@@ -1876,6 +1985,7 @@ func (m *MessageTable) validateSchemaDrift(
 	currentPK *indexMeta,
 ) error {
 	var drifts []string
+	var legacy []legacyKeyColumn
 	fields := m.Descriptor.Fields()
 	for i := 0; i < fields.Len(); i++ {
 		fieldDesc := fields.Get(i)
@@ -1907,6 +2017,16 @@ func (m *MessageTable) validateSchemaDrift(
 			displayName = onlineName + "->" + name
 		}
 
+		// 键列先认形态。旧形态（TEXT/BLOB 前缀索引、*_ci 或 PAD SPACE 排序规则）的唯一性语义本身就不对，
+		// 再拿 NOT NULL/DEFAULT ''/整列索引去逐项比较只会给出误导性的修法，所以这些列跳过通用比较。
+		// 只看列元数据、不依赖 indexesKnown：proto 没声明二级索引时，旧形态主键同样必须拦下。
+		if kind, isKey := m.keyColumnKind(fieldDesc); isKey {
+			if reason := legacyKeyColumnReason(kind, meta); reason != "" {
+				legacy = append(legacy, legacyKeyColumn{field: fieldDesc, onlineName: onlineName, meta: meta, reason: reason})
+				continue
+			}
+		}
+
 		targetType := m.getMySQLFieldType(fieldDesc)
 		wantNullable := !strings.Contains(strings.ToUpper(targetType), "NOT NULL")
 		if meta.nullable != wantNullable {
@@ -1929,8 +2049,17 @@ func (m *MessageTable) validateSchemaDrift(
 		}
 	}
 
+	// 旧形态列所在的索引要随迁移一起删掉重建，前缀长度不对是必然的，不再单独报索引漂移。
+	legacyNames := make(map[string]struct{}, len(legacy))
+	for _, col := range legacy {
+		legacyNames[string(col.field.Name())] = struct{}{}
+	}
+
 	if indexesKnown {
 		for idx, indexCols := range m.indexes {
+			if columnsReferenceAny(splitTrimmed(indexCols), legacyNames) {
+				continue
+			}
 			name := m.indexNameFor(idx)
 			online, ok := lookupIndexMeta(existingIndexes, name)
 			if !ok {
@@ -1943,7 +2072,7 @@ func (m *MessageTable) validateSchemaDrift(
 					name, formatIndexMeta(online), formatIndexMeta(want)))
 			}
 		}
-		if m.uniqueKeys != "" {
+		if m.uniqueKeys != "" && !columnsReferenceAny(splitTrimmed(m.uniqueKeys), legacyNames) {
 			name := m.uniqueKeyName()
 			if online, ok := lookupIndexMeta(existingIndexes, name); ok {
 				want := m.expectedIndexMeta(m.uniqueKeys, true)
@@ -1956,7 +2085,7 @@ func (m *MessageTable) validateSchemaDrift(
 		}
 	}
 
-	if len(m.primaryKey) > 0 && currentPK != nil {
+	if len(m.primaryKey) > 0 && currentPK != nil && !columnsReferenceAny(m.primaryKey, legacyNames) {
 		want := m.expectedIndexMeta(strings.Join(m.primaryKey, ","), true)
 		if !indexMetaEqual(*currentPK, want) {
 			drifts = append(drifts, fmt.Sprintf(
@@ -1965,19 +2094,29 @@ func (m *MessageTable) validateSchemaDrift(
 		}
 	}
 
+	if len(legacy) > 0 {
+		return m.legacyKeyColumnError(legacy, drifts, currentCols, existingIndexes, indexesKnown)
+	}
 	if len(drifts) > 0 {
 		return fmt.Errorf("%w: table %s: %s", ErrSchemaDrift, m.tableName, strings.Join(drifts, "; "))
 	}
 	return nil
 }
 
+// expectedColumnDefault proto 目标类型对应的 COLUMN_DEFAULT：数值列 "0"，键列 ""（空串而非 NULL），其余 NULL。
 func expectedColumnDefault(targetType string) sql.NullString {
-	if strings.Contains(strings.ToUpper(targetType), " DEFAULT 0") {
+	upper := strings.ToUpper(targetType)
+	if strings.Contains(upper, " DEFAULT 0") {
 		return sql.NullString{String: "0", Valid: true}
+	}
+	if strings.Contains(upper, " DEFAULT ''") {
+		return sql.NullString{String: "", Valid: true}
 	}
 	return sql.NullString{}
 }
 
+// columnDefaultsEqual 比较前去掉首尾空白与一对首尾单引号：键列声明的默认值是空串，MySQL 与 TiDB
+// 回读成空串，也有兼容实现回读成两个单引号组成的字面量，二者是同一个默认值。
 func columnDefaultsEqual(online, want sql.NullString) bool {
 	if online.Valid != want.Valid {
 		return false
@@ -1985,7 +2124,15 @@ func columnDefaultsEqual(online, want sql.NullString) bool {
 	if !online.Valid {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(online.String), strings.TrimSpace(want.String))
+	return strings.EqualFold(unquoteColumnDefault(online.String), unquoteColumnDefault(want.String))
+}
+
+func unquoteColumnDefault(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		return value[1 : len(value)-1]
+	}
+	return value
 }
 
 func formatColumnDefault(value sql.NullString) string {
@@ -2326,7 +2473,7 @@ func (m *MessageTable) GetInsertSQLWithArgs(message proto.Message) (*SqlWithArgs
 	var args []interface{}
 	for i := 0; i < m.Descriptor.Fields().Len(); i++ {
 		fieldDesc := m.Descriptor.Fields().Get(i)
-		val, err := pbconv.SerializeFieldValue(message, fieldDesc)
+		val, err := m.serializeColumnValue(message, fieldDesc)
 		if err != nil {
 			return nil, fmt.Errorf("serialize field %s: %w", fieldDesc.Name(), err)
 		}
@@ -2358,7 +2505,7 @@ func (m *MessageTable) GetBatchInsertSQLWithArgs(messages []proto.Message) (*Sql
 		args := make([]interface{}, 0, fieldCount)
 		for i := 0; i < fieldCount; i++ {
 			fieldDesc := m.Descriptor.Fields().Get(i)
-			val, err := pbconv.SerializeFieldValue(msg, fieldDesc)
+			val, err := m.serializeColumnValue(msg, fieldDesc)
 			if err != nil {
 				return nil, fmt.Errorf("serialize field %s: %w", fieldDesc.Name(), err)
 			}
@@ -2417,7 +2564,7 @@ func (m *MessageTable) GetInsertOnDupUpdateSQLWithArgs(message proto.Message) (*
 		if !reflection.Has(fieldDesc) {
 			continue
 		}
-		val, err := pbconv.SerializeFieldValue(message, fieldDesc)
+		val, err := m.serializeColumnValue(message, fieldDesc)
 		if err != nil {
 			return nil, fmt.Errorf("serialize update field %s: %w", fieldDesc.Name(), err)
 		}
@@ -2483,6 +2630,21 @@ func (p *DB) Insert(message proto.Message) error {
 func (p *DB) BatchInsert(messages []proto.Message) error {
 	if len(messages) == 0 {
 		return errors.New("no messages to insert")
+	}
+
+	// 分批写入不是原子的：先按同样的分批方式把整批键列值校验完再开始写，见 validateKeyValues。
+	for i := 0; i < len(messages); i += BatchInsertMaxSize {
+		end := i + BatchInsertMaxSize
+		if end > len(messages) {
+			end = len(messages)
+		}
+		table, err := p.tableForMessage(messages[i])
+		if err != nil {
+			return err
+		}
+		if err := table.validateKeyValues(messages[i:end], false); err != nil {
+			return fmt.Errorf("batch insert rows from %d for table %s: %w", i, table.tableName, err)
+		}
 	}
 
 	// 分批处理大批量数据
@@ -2677,6 +2839,9 @@ func (p *DB) BatchDelete(messages []proto.Message) error {
 			return err
 		}
 	}
+	if err := table.validateKeyValues(messages, true); err != nil {
+		return fmt.Errorf("batch delete for table %s: %w", table.tableName, err)
+	}
 
 	pkNames := make([]string, len(table.primaryKey))
 	for i, primaryKey := range table.primaryKey {
@@ -2765,7 +2930,7 @@ func (p *DB) UpdateFieldsByPK(message proto.Message, fields ...string) error {
 		if !ok {
 			return fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, field, table.tableName)
 		}
-		val, err := pbconv.SerializeFieldValue(message, desc)
+		val, err := table.serializeColumnValue(message, desc)
 		if err != nil {
 			return fmt.Errorf("serialize update field %s: %w", field, err)
 		}
@@ -2827,7 +2992,7 @@ func (p *DB) UpdateIfVersion(message proto.Message, versionField string) (bool, 
 	if err := table.requireNumericColumn(versionField); err != nil {
 		return false, err
 	}
-	curVersion, err := comparisonValue(message, versionDesc)
+	curVersion, err := table.comparisonValue(message, versionDesc)
 	if err != nil {
 		return false, fmt.Errorf("serialize version field %s: %w", versionField, err)
 	}
@@ -2846,7 +3011,7 @@ func (p *DB) UpdateIfVersion(message proto.Message, versionField string) (bool, 
 		if name == versionField || pkSet[name] || !reflection.Has(field) {
 			continue
 		}
-		val, err := pbconv.SerializeFieldValue(message, field)
+		val, err := table.serializeColumnValue(message, field)
 		if err != nil {
 			return false, fmt.Errorf("serialize update field %s: %w", name, err)
 		}
@@ -2906,7 +3071,7 @@ func (p *DB) UpdateFieldsIfVersion(message proto.Message, versionField string, f
 	if err := table.requireNumericColumn(versionField); err != nil {
 		return false, err
 	}
-	curVersion, err := comparisonValue(message, versionDesc)
+	curVersion, err := table.comparisonValue(message, versionDesc)
 	if err != nil {
 		return false, fmt.Errorf("serialize version field %s: %w", versionField, err)
 	}
@@ -2921,7 +3086,7 @@ func (p *DB) UpdateFieldsIfVersion(message proto.Message, versionField string, f
 		if !ok {
 			return false, fmt.Errorf("%w: %s in table %s", ErrFieldNotFound, name, table.tableName)
 		}
-		val, err := pbconv.SerializeFieldValue(message, desc)
+		val, err := table.serializeColumnValue(message, desc)
 		if err != nil {
 			return false, fmt.Errorf("serialize update field %s: %w", name, err)
 		}
@@ -3075,7 +3240,7 @@ func (m *MessageTable) getSaveUpdateSQLWithArgs(message proto.Message) (*SqlWith
 		if pkSet[name] {
 			continue
 		}
-		value, err := pbconv.SerializeFieldValue(message, field)
+		value, err := m.serializeColumnValue(message, field)
 		if err != nil {
 			return nil, fmt.Errorf("serialize save field %s: %w", field.Name(), err)
 		}
@@ -3200,8 +3365,8 @@ func saveCurrentRowMatchArg(field protoreflect.FieldDescriptor, arg interface{})
 // comparisonValue 序列化 message 字段后，把数值标量恢复成带类型的 driver 参数。
 // 写入数值列时十进制字符串通常安全，但用于 WHERE/CAS 比较会触发 MySQL 的字符串↔数值
 // 隐式 DOUBLE 转换，进而丢失 64 位整数精度。
-func comparisonValue(message proto.Message, field protoreflect.FieldDescriptor) (interface{}, error) {
-	value, err := pbconv.SerializeFieldValue(message, field)
+func (m *MessageTable) comparisonValue(message proto.Message, field protoreflect.FieldDescriptor) (interface{}, error) {
+	value, err := m.serializeColumnValue(message, field)
 	if err != nil {
 		return nil, err
 	}
@@ -3362,7 +3527,7 @@ func (m *MessageTable) GetReplaceSQLWithArgs(message proto.Message) (*SqlWithArg
 	var args []interface{}
 	for i := 0; i < m.Descriptor.Fields().Len(); i++ {
 		fieldDesc := m.Descriptor.Fields().Get(i)
-		val, err := pbconv.SerializeFieldValue(message, fieldDesc)
+		val, err := m.serializeColumnValue(message, fieldDesc)
 		if err != nil {
 			return nil, fmt.Errorf("serialize field %s: %w", fieldDesc.Name(), err)
 		}
@@ -3391,7 +3556,7 @@ func (m *MessageTable) GetUpdateSetWithArgs(message proto.Message) (string, []in
 			continue
 		}
 
-		val, err := pbconv.SerializeFieldValue(message, field)
+		val, err := m.serializeColumnValue(message, field)
 		if err != nil {
 			return "", nil, fmt.Errorf("serialize update field %s: %w", field.Name(), err)
 		}
@@ -3613,6 +3778,9 @@ func (p *DB) BatchSave(messages []proto.Message) error {
 		if err := table.validateMessageDescriptor(msg); err != nil {
 			return err
 		}
+	}
+	if err := table.validateKeyValues(messages, false); err != nil {
+		return fmt.Errorf("batch save for table %s: %w", table.tableName, err)
 	}
 
 	for i, message := range messages {
@@ -4641,6 +4809,21 @@ func WithAutoIncrementKey(key string) TableOption {
 func WithNullableFields(fields ...string) TableOption {
 	return func(t *MessageTable) {
 		t.nullableFields = fields
+	}
+}
+
+// WithMaxLength 设置主键/唯一键里 string/bytes 字段的列宽 n（string 按字符、bytes 按字节），
+// 适用范围与取值区间见 proto2mysql_option.proto 的 max_length。
+//
+// 按字段合并，不是整体替换：多次调用只覆盖同名字段，其它字段已有的长度保留，同一字段后应用的覆盖先应用的。
+// RegisterTable / NewSQLBuilder 先应用 proto 里声明的 max_length，再应用代码传入的选项，
+// 所以代码传入的值覆盖 proto 声明，而代码没提到的字段仍沿用 proto 声明。
+func WithMaxLength(field string, n uint32) TableOption {
+	return func(t *MessageTable) {
+		if t.maxLengths == nil {
+			t.maxLengths = make(map[string]uint32)
+		}
+		t.maxLengths[field] = n
 	}
 }
 

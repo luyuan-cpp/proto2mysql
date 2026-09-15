@@ -342,8 +342,8 @@ stmt, err = b.DeleteWhereLimit("`created_at` < ?", []interface{}{cutoff}, "", 10
 | float        | float NOT NULL DEFAULT 0 | - |
 | double       | double NOT NULL DEFAULT 0 | - |
 | bool         | tinyint(1) NOT NULL DEFAULT 0 | - |
-| string       | MEDIUMTEXT | - |
-| bytes        | MEDIUMBLOB | 原样存储，不做编码 |
+| string       | MEDIUMTEXT；在主键/唯一键里为 VARCHAR(N) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' | 键列 N 默认 191，见「字符串键（第三方 ID）」 |
+| bytes        | MEDIUMBLOB；在主键/唯一键里为 VARBINARY(N) NOT NULL DEFAULT '' | 原样存储，不做编码 |
 | enum         | int NOT NULL DEFAULT 0 | 存储枚举值的数字表示 |
 | message      | MEDIUMBLOB | proto wire 格式**裸字节** |
 | map          | MEDIUMBLOB | proto wire 格式**裸字节** |
@@ -384,7 +384,7 @@ MySQL 的 `FLOAT`/`DOUBLE` 没有 NaN/Inf 的表示。写入时本库直接返�
 与手写 `proto.Marshal(v)` 后直接 `Exec(sql, blob)` 的结果**逐字节相同**。因此这些列可以和
 不经本库的手写 SQL 混用：别处写的行本库读得出来，本库写的行别处也读得出来。
 
-不做 Base64 的原因：目标列是 `MEDIUMBLOB`，本身二进制安全，Base64 只会白白多占 33% 体积
+不做 Base64 的原因：目标列是 `MEDIUMBLOB`/`VARBINARY`，本身二进制安全，Base64 只会白白多占 33% 体积
 （实测 8238 B → 10984 B），并在每次读写上加一次编解码与一次分配。要在 SQL 控制台查看内容，
 用 MySQL 自带的 `TO_BASE64()` 即可，不必为此付出存储代价：
 
@@ -392,8 +392,9 @@ MySQL 的 `FLOAT`/`DOUBLE` 没有 NaN/Inf 的表示。写入时本库直接返�
 SELECT TO_BASE64(`player`) FROM `golang_test` WHERE `id` = 1;
 ```
 
-> ⚠️ **列类型必须是 BLOB 系**。裸字节写进 utf8mb4 的 `TEXT` / `VARCHAR` 列会因非法 UTF-8
-> 被拒或损坏。本库建表时这几类字段统一映射为 `MEDIUMBLOB`，只有手工建的表才可能踩到。
+> ⚠️ **列类型必须是二进制类型**。裸字节写进 utf8mb4 的 `TEXT` / `VARCHAR` 列会因非法 UTF-8
+> 被拒或损坏。本库建表时这几类字段映射为 `MEDIUMBLOB`（主键/唯一键里的 `bytes` 为 `VARBINARY`），
+> 只有手工建的表才可能踩到。
 
 > ⚠️ **从 Base64 版本升级**：早期版本把这些字段编码成 Base64 落库。升级后写入格式变了，
 > 存量行必须先就地还原，否则读出来会 `cannot parse invalid wire-format data`：
@@ -405,18 +406,90 @@ SELECT TO_BASE64(`player`) FROM `golang_test` WHERE `id` = 1;
 > 迁移期间**不要**让新旧两个版本同时读写同一张表（新版本写的裸字节，旧版本会当 Base64 解码
 > 而失败）。要灰度并存，得先加新列双写、读侧兼容两种格式，验证后再切、再删旧列。
 
+## 字符串键（第三方 ID）
+
+第三方登录的账号 ID（例如 Google 的 `sub`：最长 255 个区分大小写的 ASCII 字符）、订单号这类字符串，
+可以直接放进主键或唯一键。**放进键里**的标量 `string` / `bytes` 不再映射成 `MEDIUMTEXT` / `MEDIUMBLOB`：
+
+| 字段 | 列类型 | 比较语义 |
+|---|---|---|
+| `string` | `VARCHAR(N) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''` | 按码点比较：区分大小写，尾部空格参与比较（NO PAD） |
+| `bytes` | `VARBINARY(N) NOT NULL DEFAULT ''` | 逐字节比较：`'a'`、`'a '`、`'a\0'` 是三个不同的键 |
+
+索引建在**整列**上（这一列出现在普通索引里时也是整列）。原先的 `MEDIUMTEXT` 只能建 191 前缀索引，
+唯一性只覆盖前 191 个字符；`utf8mb4_unicode_ci` 会把 `'AbC'` 与 `'abc'` 判为重复，`utf8mb4_bin` 是 PAD SPACE，
+会把 `'abc'` 与 `'abc '` 判为重复——三者都会让两个不同的外部账号撞成同一个键。
+不在主键/唯一键里的 string/bytes 映射不变。
+
+### 推荐形态：数值代理主键 + 唯一键
+
+```protobuf
+message third_party_account {
+  option (proto2mysql.table_name)         = "third_party_account";
+  option (proto2mysql.primary_key)        = "id";
+  option (proto2mysql.auto_increment_key) = "id";
+  option (proto2mysql.unique_key)         = "provider,provider_id";
+
+  uint64 id          = 1;
+  string provider    = 2 [(proto2mysql.max_length) = 32];
+  string provider_id = 3 [(proto2mysql.max_length) = 255];  // Google sub 最长 255 个字符
+  uint64 player_id   = 4;
+}
+```
+
+内部关联（背包、邮件、好友）用 `uint64 id`，外部 ID 只在登录时按 `(provider, provider_id)` 查一次。
+也可以直接用 string 主键（`primary_key = "provider_id"`），DDL 与写入校验完全相同。
+
+### max_length、字节预算与写入校验
+
+- N 默认 191；`string` 取 1..768（按字符计），`bytes` 取 1..3072（按字节计）。proto 里写
+  `[(proto2mysql.max_length) = 255]`，代码里用 `WithMaxLength("provider_id", 255)`（按字段合并，覆盖 proto 声明）。
+- `max_length` 目前只能写在主键/唯一键的 string/bytes 字段上；写在其它字段、显式写 0 或越界都返回 `ErrInvalidTableOption`。
+- 单个索引（主键、唯一键、每个普通索引**各自**计算）所有列合计不超过 3072 字节：`VARCHAR(N)` 按 4N 计、
+  `VARBINARY(N)` 按 N 计，int32/uint32/enum/float 计 4，int64/uint64/double/Timestamp 计 8，bool 计 1，
+  普通索引里不在键中的 string/bytes 走 191 前缀（分别计 764/191）。超出时建表前报错并列出每列占用。
+- 写入前按 N 校验：string 按字符数（4 字节的 emoji 算 1 个）且必须是合法 UTF-8，bytes 按字节数。
+  不合格返回 `ErrInvalidKeyValue`，**在任何 SQL 发出之前**失败，不会被截断成另一个键；
+  批量接口先校验整批再写第一批。错误信息只带表、列、实际长度与上限，不回显值。
+- 键列不能声明 `nullable`：写入路径从不给 string/bytes 写 NULL（未赋值写 `''`），可空并不能让未赋值的行不参与唯一性。
+
+### 版本要求
+
+- MySQL ≥ 8.0.17（`utf8mb4_0900_bin` 从这个版本开始提供）。
+- TiDB 需要新排序规则框架（`new_collations_enabled_on_first_bootstrap`，新集群默认开启，只能在集群初始化时决定）。
+- MySQL 5.7 没有 `utf8mb4_0900_bin`：字符串键请声明成 `bytes` 字段（`VARBINARY` 逐字节比较）。
+
+### 限制
+
+- **不可降级**：新版本建出（或迁移后）的 `VARCHAR/VARBINARY` 键列，旧版本同步时会报 `ErrSchemaDrift`
+  （旧版本期望 `MEDIUMTEXT` + 191 前缀），含字符串键的表不能再回滚到旧版本。
+- 给已有多行数据的表**新增**一个非空 string 唯一键列时，旧行在新列上全是 `''`，补唯一键会撞 1062——
+  与新增数值唯一键列（旧行全是 0）是同一类问题，需要先回填再加键。
+
+### 旧表迁移
+
+旧版本给唯一键里的 string 建的是 `MEDIUMTEXT` 可空列 + `(191)` 前缀索引。新版本同步到这类表（以及 `*_ci`、
+`utf8mb4_bin` 排序规则的 VARCHAR 键列）时返回 `ErrSchemaDrift` + `ErrLegacyKeyColumn`，**不执行任何 DDL**；
+错误信息里有逐列原因、迁移步骤和按实际表名填好的 SQL。步骤与实测过的 SQL 见
+[docs/schema-evolution.md](docs/schema-evolution.md#legacy-key-columns)。
+
 ## 配置选项
 
 通过 `TableOption` 函数可以配置表的各种属性：
 
 - `WithPrimaryKey(keys ...string)`: 设置主键字段；仅接受具有稳定等值身份语义、可完整索引且为
-  `NOT NULL` 的字段。当前 string/bytes 映射只能做前缀索引，会被拒绝；float/double 的
-  十进制、二进制与数据库比较语义不适合作为稳定身份，也会在 DDL 前被拒绝
+  `NOT NULL` 的字段。标量 string/bytes 映射为 `VARCHAR`/`VARBINARY` 整列索引，可以做主键（见「字符串键」）；
+  repeated/map/message 只能落 BLOB 前缀索引，float/double 的十进制、二进制与数据库比较语义不适合作为
+  稳定身份，都会在 DDL 前被拒绝
 - `WithIndexes(indexes ...string)`: 设置普通索引
-- `WithUniqueKey(uniqueKey string)`: 设置唯一键
+- `WithUniqueKey(uniqueKey string)`: 设置唯一键；其中的 string/bytes 同样映射为 `VARCHAR`/`VARBINARY` 整列
 - `WithAutoIncrementKey(key string)`: 设置自增字段
-- `WithNullableFields(fields ...string)`: 设置允许为 NULL 的字段
+- `WithNullableFields(fields ...string)`: 设置允许为 NULL 的字段（主键/唯一键里的 string/bytes 不能可空）
+- `WithMaxLength(field string, n uint32)`: 主键/唯一键里 string/bytes 字段的列宽，按字段合并，覆盖 proto 的 `max_length`
 - `WithTiDBNonclusteredPK()` / `WithTiDBShardRowIDBits(bits)` / `WithTiDBPreSplitRegions(n)` / `WithTiDBAutoIDCacheOne()`: TiDB 方言，见下节
+
+这些选项在 .proto 里都有等价写法（定义见 `proto/proto2mysql_option.proto`）：`table_name` / `primary_key` /
+`auto_increment_key` / `index` / `unique_key` / `tidb_*` 是 message option，`nullable` / `max_length` 是 field option。
 
 ## TiDB 支持
 

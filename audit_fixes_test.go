@@ -296,6 +296,13 @@ func TestAlignedColumnTypeKeepsTargetAttributes(t *testing.T) {
 		// 有无符号两边都可能装不下对方，纯 helper 也必须保留线上类型；
 		// 真正的迁移规划会返回 ErrUnsafeSchemaConversion。
 		{"int", "int unsigned NOT NULL DEFAULT 0", "int NOT NULL DEFAULT 0"},
+		// 键列收窄被挡下时同样只换类型本体：字符集、COLLATE、NOT NULL DEFAULT '' 都是键列形态的一部分，
+		// 丢了 COLLATE 会退回表默认的 utf8mb4_unicode_ci，唯一性变成大小写不敏感。
+		{"varchar(255)",
+			"VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+			"varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''"},
+		{"varbinary(255)", "VARBINARY(191) NOT NULL DEFAULT ''", "varbinary(255) NOT NULL DEFAULT ''"},
+		{"varbinary(64)", "VARBINARY(191) NOT NULL DEFAULT ''", "VARBINARY(191) NOT NULL DEFAULT ''"},
 	}
 	for _, c := range cases {
 		if got := alignedColumnType(c.current, c.target); got != c.want {
@@ -472,17 +479,10 @@ func TestMigrationSQLIncludesIndexesAndPrimaryKey(t *testing.T) {
 		WithPrimaryKey("id"), WithIndexes("player_id"), WithUniqueKey("ip"))
 
 	conn.queueRows(
-		rows(row(int64(1))), // 表存在
-		rows( // 列已对齐
-			colRow("id", "int unsigned", 1),
-			colRow("ip", "mediumtext", 2),
-			colRow("port", "int unsigned", 3),
-			colRow("group_id", "int unsigned", 4),
-			colRow("player", "mediumblob", 5),
-			colRow("player_id", "bigint unsigned", 6),
-		),
-		nil, // 既有索引：一个都没有
-		nil, // 主键：没有
+		rows(row(int64(1))),              // 表存在
+		golangTestAlignedColsWithIPKey(), // 列已对齐（ip 在唯一键里，线上已是 varchar 键列）
+		nil,                              // 既有索引：一个都没有
+		nil,                              // 主键：没有
 	)
 
 	stmt, err := pdb.GenerateMigrationSQL(&testpb.GolangTest{})
@@ -492,8 +492,8 @@ func TestMigrationSQLIncludesIndexesAndPrimaryKey(t *testing.T) {
 	if !strings.Contains(stmt, "ADD INDEX `idx_golang_test_0` (`player_id`)") {
 		t.Errorf("迁移脚本必须包含补索引: %s", stmt)
 	}
-	if !strings.Contains(stmt, "ADD UNIQUE KEY `uk_golang_test` (`ip`(191))") {
-		t.Errorf("迁移脚本必须包含补唯一键（TEXT 列带前缀长度）: %s", stmt)
+	if !strings.Contains(stmt, "ADD UNIQUE KEY `uk_golang_test` (`ip`)") {
+		t.Errorf("迁移脚本必须包含补唯一键（键列 VARCHAR 整列，不带前缀）: %s", stmt)
 	}
 	if !strings.Contains(stmt, "ADD PRIMARY KEY (`id`)") {
 		t.Errorf("迁移脚本必须包含补主键: %s", stmt)

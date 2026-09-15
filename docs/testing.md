@@ -59,6 +59,20 @@ PROTO2MYSQL_DSN="mysql://root:@127.0.0.1:14000/proto2mysql_test" \
 | MySQL 8.4 | **102 PASS, 0 SKIP** |
 | TiDB v8.5.1 | 101 PASS, 1 SKIP（见下） |
 
+### 字符串键列的真库用例（Go）
+
+`string_key_integration_test.go` 的 4 条只在 `PROTO2MYSQL_INTEGRATION=1` 时跑，**MySQL 与 TiDB 都必须跑过、不得跳过**：
+
+| 用例 | 验什么 |
+|---|---|
+| `TestStringPrimaryKeyRealDatabase` | 建表后连续同步两次零 ALTER、零漂移，回读形态是 `varchar(N)` NOT NULL、DEFAULT `''`（空串而非 NULL）、`utf8mb4_0900_bin`、整列主键；`'AbC'` / `'abc'` / `'abc '` 各自成行并按主键读回原值；恰好 N 个字符（含 4 字节字符）可写，N+1 返回 `ErrInvalidKeyValue` 且不落库 |
+| `TestBytesPrimaryKeyRealDatabase` | `'a'` / `'a '` / `'a\0'` 各自成行；`varbinary` 回读无排序规则、DEFAULT `''` |
+| `TestLegacyUniqueKeyMigrationRealDatabase` | 旧形态 `MEDIUMTEXT` 可空 + `UNIQUE(col(191))`：同步与 `GenerateMigrationSQL` 都返回 `ErrLegacyKeyColumn`，表结构不变；**逐条执行错误信息里的 SQL** 后再同步零漂移，大小写不同的值可以共存 |
+| `TestLegacyPrimaryKeyMigrationRealDatabase` | `varchar(191) utf8mb4_unicode_ci` 主键：同上，走影子表重建（TiDB 聚簇主键不能原地改）；`-v` 日志里打印实际执行的迁移 SQL |
+
+用例自己建表，结束时 DROP（包括影子表 `__p2m_new` 与备份表 `__p2m_old`）。
+多节点集群用例（`TestTiDBCluster*`）没有 `PROTO2MYSQL_TEST_DSN2` 时跳过属预期。
+
 ## 三、TiDB 的能力边界
 
 TiDB 把自己报成 `8.0.11-TiDB-v8.5.1`——**它声称自己是 MySQL 8.0**，
@@ -124,15 +138,28 @@ python tools/parity_diff.py /tmp/parity.go.json /tmp/parity.py.json
 
 ### 它比什么
 
-当前语料 **42 条**，覆盖：
+当前 Go 侧语料 **66 条**（`corpus_version` = 2），覆盖：
 
 | 类别 | 覆盖 |
 |---|---|
-| DDL | 建表：无选项 / 主键+自增 / 索引+唯一键 / 可空列 |
+| DDL | 建表：无选项 / 主键+自增 / 索引+唯一键 / 可空列 / string 主键 / string 主键 + `max_length` / bytes 唯一键 |
 | ALTER | 空表 / 缺一列 / 按字段号改名 / 回填 pb:N 注释 / **线上列更宽时不动它** |
 | DML 写 | insert、insert_set_fields、insert_ignore、replace、**save(ODKU)**、三个 batch、三个 upsert |
 | DML 改 | update_by_pk、update_by_pk_if、update_fields_by_pk、incr、decr_if_enough |
 | DML 读 | select_by_pk、for_update、select_where（含分页）、count、exists、delete_by_pk |
+
+> **语料 v2（2026-09-15，字符串键列）**：`corpus_version` 从 1 升到 2。
+>
+> - `ddl/create/index_unique` 的输出变了：唯一键里的 `ip` 从 `MEDIUMTEXT` + `(191)` 前缀变成
+>   `VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''` + 整列唯一键。
+> - 新增 3 条：`ddl/create/string_pk`（GolangTest，`WithPrimaryKey("ip")` 并清掉自增）、
+>   `ddl/create/string_pk_max_length`（同上再加 `WithMaxLength("ip", 255)`）、`ddl/create/bytes_unique`。
+> - `bytes_unique` 的样本消息不在 testpb 里（testpb 没有 bytes 字段），Python 侧须按
+>   `message key_probe { uint64 id = 1; string provider = 2; bytes token = 3; }` 构造，
+>   表名 `bytes_key_probe`、主键 `id`、唯一键 `provider,token`。
+> - **Python 侧需同步**：Python 实现 proto2mysql-py 目前本机与 GitHub 上都找不到，本次没有改它。
+>   在它跟上之前，对拍会报用例集不一致与 `ddl/create/index_unique` 的 SQL 不一致；要同步的是键列类型映射、
+>   `max_length` 选项与校验、写入前键值校验（`ErrInvalidKeyValue`）以及旧形态识别（`ErrLegacyKeyColumn`）。
 
 会报三类问题，**任何一类都算失败**：
 
@@ -214,7 +241,7 @@ PROTO2MYSQL_INTEGRATION=1 PROTO2MYSQL_TEST_DSN="root:@tcp(127.0.0.1:14001)/proto
 | Python @ MySQL 8.4 | **274 passed / 0 skipped** |
 | Python @ TiDB standalone | 273 passed / 1 skipped |
 | Python @ TiDB 集群 | 273 passed / 1 skipped |
-| 跨语言对拍 | ✅ 63 条逐字节一致 |
+| 跨语言对拍 | ✅ 63 条逐字节一致（语料 v1）；v2 的 66 条待 Python 侧同步 |
 
 ---
 

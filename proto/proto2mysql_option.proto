@@ -15,7 +15,7 @@
 //	  option (proto2mysql.unique_key)         = "email";        // 逗号分隔 = 联合唯一键
 //
 //	  uint64 id = 1;
-//	  string email = 2;
+//	  string email = 2 [(proto2mysql.max_length) = 255];        // 主键/唯一键里的 string/bytes 列宽（默认 191）
 //	  string display_name = 3 [(proto2mysql.nullable) = true];  // 该列允许为 NULL
 //	  uint64 last_login = 4;
 //	}
@@ -71,4 +71,13 @@ extend google.protobuf.MessageOptions {
 extend google.protobuf.FieldOptions {
   // 该字段对应的列允许为 NULL（默认 NOT NULL）
   optional bool nullable = 600100;
+  // 主键/唯一键里 string/bytes 字段的最大长度，决定整列索引的列宽：
+  //   string → VARCHAR(N) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin，N 按字符计，取值 1..768；
+  //   bytes  → VARBINARY(N)，N 按字节计，取值 1..3072。
+  // 不声明时 N = 191。目前仅用于主键/唯一键的 string/bytes 字段，声明在其它字段上（含显式写 0）会被拒绝。
+  // 字节预算：单个索引（主键、唯一键、每个普通索引各自计算）所有列合计不得超过 3072 字节（InnoDB
+  // 超出报 Error 1071）。VARCHAR(N) 按 4N 计、VARBINARY(N) 按 N 计；int32/uint32/enum/float 计 4，
+  // int64/uint64/double/Timestamp 计 8，bool 计 1；普通索引里的非键 string/bytes 走 191 前缀，分别计 764/191。
+  // 写入前按 N 校验，超长或非法 UTF-8 返回 ErrInvalidKeyValue，不会截断。
+  optional uint32 max_length = 600101;
 }

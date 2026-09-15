@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+import "proto2mysql_option.proto";
+
+option (proto2mysql.db) = true;
+
+// third_party_account 用于测试字符串键：uint64 代理主键 + (provider, provider_id) 唯一键，
+// provider_id 按第三方 ID 的长度上限声明 max_length；token_hash 不在任何键里，仍落 MEDIUMBLOB。
+message third_party_account {
+  option (proto2mysql.table_name)         = "third_party_account";
+  option (proto2mysql.primary_key)        = "id";
+  option (proto2mysql.auto_increment_key) = "id";
+  option (proto2mysql.unique_key)         = "provider,provider_id";
+
+  uint64 id          = 1;
+  string provider    = 2 [(proto2mysql.max_length) = 32];
+  string provider_id = 3 [(proto2mysql.max_length) = 255];
+  bytes  token_hash  = 4;
+}

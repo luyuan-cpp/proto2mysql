@@ -327,7 +327,11 @@ SELECT MAX(CHAR_LENGTH(`col`)) AS max_chars, SUM(`col` IS NULL) AS null_rows, CO
 - `max_chars` / `max_bytes` 超过目标长度时先人工处理：迁移块第一条已经把会话切成严格模式
   （`SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), 'STRICT_ALL_TABLES')`），
   装不下是**报错中断**而不是静默截断——非严格模式下截断后的数据会被 `RENAME` 成正式表，不可回滚。
-- `null_rows` 多于 1 行时，先人工给它们赋唯一值或删除：NULL 改写成 `''` 后会互相撞键，也会与已有的 `''` 撞。
+- `null_rows` **只要不是 0** 就先人工给它们赋唯一值或删除：NULL 改写成 `''` 后不只会互相撞键，
+  还会与表里**已有的** `''` 撞——所以一行 NULL 也可能撞。同时查一下已有的空串有几行：
+  `SELECT COUNT(*) FROM \`t\` WHERE \`col\` = ''`。这一步不处理，原地 ALTER 路径会在
+  `ADD UNIQUE KEY` 撞 Error 1062，影子表路径会在 `INSERT ... SELECT` 撞 Error 1062，
+  都是在维护窗口里中途失败（影子表路径此时已经建了影子表，要先 `DROP` 掉再从头来）。
 
 从前缀唯一 / `*_ci` / PAD SPACE 换成整列、区分大小写、NO PAD，唯一性只会变宽松，已有数据不会因此出现新的重复；
 会撞键的只有 NULL 改写成 `''` 这一步。

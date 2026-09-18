@@ -297,7 +297,12 @@ func (m *MessageTable) legacyKeyColumnError(
 
 	var checks, statements []string
 	if inPrimaryKey {
-		checks, statements = m.legacyKeyRebuildSQL(&b, legacy, currentCols, existingIndexes, indexesKnown)
+		var err error
+		// 影子表的列匹配与主路径同样 fail-closed：列身份歧义时报那条错，
+		// 而不是拼一条可能把数据灌错列的 INSERT ... SELECT。
+		if checks, statements, err = m.legacyKeyRebuildSQL(&b, legacy, currentCols, existingIndexes, indexesKnown); err != nil {
+			return err
+		}
 	} else {
 		checks, statements = m.legacyKeyAlterSQL(&b, legacy, existingIndexes, indexesKnown)
 	}
@@ -340,21 +345,25 @@ const strictModeSQL = "SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sq
 // legacyValueCheckSQL 每个旧形态列一条：目标列装不装得下、有多少行是 NULL（NULL 要改写成空串，
 // 会与已有的空串及彼此撞键）。string 按字符数、bytes 按字节数，与写入前的校验同口径。
 func (m *MessageTable) legacyValueCheckSQL(legacy []legacyKeyColumn) []string {
-	table := escapeMySQLName(m.tableName)
 	checks := make([]string, 0, len(legacy))
 	for _, col := range legacy {
-		name := string(col.field.Name())
-		online := escapeMySQLName(col.onlineName)
-		lengthExpr, alias := "CHAR_LENGTH", "max_chars"
-		if col.field.Kind() == protoreflect.BytesKind {
-			lengthExpr, alias = "LENGTH", "max_bytes"
-		}
-		checks = append(checks, fmt.Sprintf(
-			"SELECT MAX(%s(%s)) AS %s, SUM(%s IS NULL) AS null_rows, COUNT(*) AS rows_total FROM %s",
-			lengthExpr, online, alias, online, table)+
-			fmt.Sprintf(" /* 目标列 %s 上限 %d */", name, m.keyColumnLength(name)))
+		checks = append(checks, m.keyValueCheckSQL(col.field, col.onlineName))
 	}
 	return checks
+}
+
+// keyValueCheckSQL 一个键列的值核对查询：装不装得下目标长度、有多少行是 NULL。
+func (m *MessageTable) keyValueCheckSQL(field protoreflect.FieldDescriptor, onlineName string) string {
+	name := string(field.Name())
+	online := escapeMySQLName(onlineName)
+	lengthExpr, alias := "CHAR_LENGTH", "max_chars"
+	if field.Kind() == protoreflect.BytesKind {
+		lengthExpr, alias = "LENGTH", "max_bytes"
+	}
+	return fmt.Sprintf(
+		"SELECT MAX(%s(%s)) AS %s, SUM(%s IS NULL) AS null_rows, COUNT(*) AS rows_total FROM %s",
+		lengthExpr, online, alias, online, escapeMySQLName(m.tableName)) +
+		fmt.Sprintf(" /* 目标列 %s 上限 %d */", name, m.keyColumnLength(name))
 }
 
 func (m *MessageTable) keyColumnRoles(name string) string {
@@ -485,37 +494,74 @@ type shadowColumn struct {
 }
 
 // shadowColumns 把 proto 字段与线上列对上，并算出影子表里每列的定义。
-// 匹配顺序与 buildColumnClauses 一致：先按列名（MySQL 大小写不敏感），再按 COMMENT 'pb:N' 的字段号，
-// 后者按列名字典序取最小的候选，保证改过名的列在 INSERT ... SELECT 里引用的是线上那个名字。
-func (m *MessageTable) shadowColumns(legacy []legacyKeyColumn, currentCols map[string]columnMeta) map[string]shadowColumn {
+//
+// 匹配顺序与**记账方式**都必须与 buildColumnClauses 一致：先按列名（MySQL 大小写不敏感）认领，
+// 认领掉的列从 remaining 里删掉，第二轮才按 COMMENT 'pb:N' 的字段号回退（按列名字典序取最小的候选），
+// 保证改过名的列在 INSERT ... SELECT 里引用的是线上那个名字。
+//
+// ⚠️ 少了这层记账，同一个线上列会被两个字段同时认领：线上列 name 带 COMMENT 'pb:2'，
+// proto 把 2 号字段改名成 nickname 又新增一个叫 name 的字段时，nickname 按 pb:2 认领 name、
+// 新字段 name 又按列名认领同一列，产出
+// INSERT INTO t__p2m_new (nickname, name) SELECT name, name FROM t——新字段被灌进旧数据，
+// 而两列同族时这一步不会报错，是静默错数据。
+//
+// lookupColumnMeta 的 error 不能丢：大小写折叠后有多个候选时列身份已经歧义，
+// 与主路径一样 fail-closed，不猜哪一列是真实数据。
+func (m *MessageTable) shadowColumns(legacy []legacyKeyColumn, currentCols map[string]columnMeta) (map[string]shadowColumn, error) {
 	legacyByName := make(map[string]struct{}, len(legacy))
 	for _, col := range legacy {
 		legacyByName[string(col.field.Name())] = struct{}{}
 	}
+	remaining := make(map[string]columnMeta, len(currentCols))
+	for name, meta := range currentCols {
+		remaining[name] = meta
+	}
 
 	fields := m.Descriptor.Fields()
 	columns := make(map[string]shadowColumn, fields.Len())
-	for i := 0; i < fields.Len(); i++ {
-		field := fields.Get(i)
-		name := string(field.Name())
-		onlineName, meta, ok, _ := m.lookupColumnMeta(currentCols, name)
-		if !ok {
-			for candidate, candidateMeta := range currentCols {
-				if candidateMeta.fieldNum == field.Number() && (!ok || candidate < onlineName) {
-					onlineName, meta, ok = candidate, candidateMeta, true
-				}
-			}
-		}
-		_, isLegacy := legacyByName[name]
-		columns[name] = shadowColumn{
+	newColumn := func(field protoreflect.FieldDescriptor, onlineName string, meta columnMeta, exists bool) shadowColumn {
+		_, isLegacy := legacyByName[string(field.Name())]
+		return shadowColumn{
 			onlineName: onlineName,
 			meta:       meta,
-			exists:     ok,
+			exists:     exists,
 			legacy:     isLegacy,
-			colType:    m.shadowColumnType(field, meta, ok, isLegacy),
+			colType:    m.shadowColumnType(field, meta, exists, isLegacy),
 		}
 	}
-	return columns
+
+	// 第一轮：按列名认领
+	byFieldNum := make([]protoreflect.FieldDescriptor, 0, fields.Len())
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		onlineName, meta, ok, err := m.lookupColumnMeta(remaining, string(field.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			byFieldNum = append(byFieldNum, field)
+			continue
+		}
+		delete(remaining, onlineName)
+		columns[string(field.Name())] = newColumn(field, onlineName, meta, true)
+	}
+
+	// 第二轮：剩下的列按 pb:N 回退
+	for _, field := range byFieldNum {
+		var onlineName string
+		var meta columnMeta
+		ok := false
+		for candidate, candidateMeta := range remaining {
+			if candidateMeta.fieldNum == field.Number() && (!ok || candidate < onlineName) {
+				onlineName, meta, ok = candidate, candidateMeta, true
+			}
+		}
+		if ok {
+			delete(remaining, onlineName)
+		}
+		columns[string(field.Name())] = newColumn(field, onlineName, meta, ok)
+	}
+	return columns, nil
 }
 
 // shadowColumnType 影子表里这一列的定义。
@@ -549,26 +595,44 @@ func (m *MessageTable) shadowColumnType(field protoreflect.FieldDescriptor, meta
 func (m *MessageTable) legacyKeyRebuildSQL(
 	b *strings.Builder, legacy []legacyKeyColumn, currentCols map[string]columnMeta,
 	existingIndexes map[string]indexMeta, indexesKnown bool,
-) (checks, statements []string) {
+) (checks, statements []string, err error) {
 	table := escapeMySQLName(m.tableName)
 	shadowName := truncateIdentifier(m.tableName + "__p2m_new")
 	shadow := escapeMySQLName(shadowName)
 	backup := escapeMySQLName(truncateIdentifier(m.tableName + "__p2m_old"))
 
-	columns := m.shadowColumns(legacy, currentCols)
+	columns, err := m.shadowColumns(legacy, currentCols)
+	if err != nil {
+		return nil, nil, err
+	}
+	narrowedNames := m.shrinkShadowKeysToIndexBudget(columns)
+	var narrowed []string
+	for _, name := range narrowedNames {
+		narrowed = append(narrowed, fmt.Sprintf("%s %s", escapeMySQLName(name), columns[name].colType))
+	}
 	var targets, sources []string
+	var notNullGaps []legacyNotNullGap
 	matched := make(map[string]struct{}, len(currentCols))
 	fields := m.Descriptor.Fields()
 	for i := 0; i < fields.Len(); i++ {
-		name := string(fields.Get(i).Name())
+		field := fields.Get(i)
+		name := string(field.Name())
 		column := columns[name]
 		if !column.exists {
 			continue
 		}
 		matched[column.onlineName] = struct{}{}
 		source := escapeMySQLName(column.onlineName)
-		if column.legacy && column.meta.nullable {
+		switch {
+		case column.legacy && column.meta.nullable:
 			source = "COALESCE(" + source + ", '')"
+		case column.meta.nullable && shadowColumnIsNotNull(column.colType):
+			// 线上可空、影子表按 proto 是 NOT NULL 的列。本库**不**替它们改写数据：
+			// NULL 与 0/'' 语义不同（"没填过"不等于"填了 0"），同步路径遇到同一种错配也是
+			// 报 nullable mismatch 漂移、交人处理，这里没有理由更激进。
+			// 但必须点名并给出核对查询——否则整表拷贝会在第一条有 NULL 的行上报 Error 1048，
+			// 前面建表那几步全白做。旧形态键列不在此列：它们的 NULL 本来就要改写成 ''。
+			notNullGaps = append(notNullGaps, legacyNotNullGap{onlineName: column.onlineName, colType: column.colType})
 		}
 		targets = append(targets, escapeMySQLName(name))
 		sources = append(sources, source)
@@ -589,16 +653,27 @@ func (m *MessageTable) legacyKeyRebuildSQL(
 	b.WriteString("\n  1) 预检（下面的核对查询给出实际数字）：NULL 改成 '' 后会互相重复、也会与已有的 '' 撞键" +
 		"（线上未声明的唯一索引同样会撞），须先人工改成唯一值或删除；string 列的 CHAR_LENGTH、bytes 列的 LENGTH " +
 		"不得超过目标长度，否则拷贝会失败（SQL 块第一条已把会话切成严格模式，超长是报错而不是静默截断）")
+	if len(notNullGaps) > 0 {
+		fmt.Fprintf(b, "\n     其中这些列线上可空、按 proto 在影子表里是 NOT NULL：%v。"+
+			"本库不替它们改写数据（NULL 与 0/'' 语义不同），核对查询里的 null_rows 非零时**必须先人工回填**"+
+			"（UPDATE %s SET 列 = 影子表里的 DEFAULT WHERE 列 IS NULL），否则 INSERT ... SELECT 报 Error 1048",
+			formatShadowColumnList(notNullGaps), table)
+	}
 	fmt.Fprintf(b, "\n  2) 核对外键与触发器：RENAME 只搬表本身——引用本表的外键会跟着指向 %s，本表上的触发器也留在 %s 上；"+
-		"CHECK 约束、FULLTEXT/SPATIAL 索引、分区同样不会进影子表。执行下面的核对查询，"+
+		"CHECK 约束、分区同样不会进影子表，FULLTEXT/SPATIAL 索引也不会（线上有的话下面会逐条点名）。执行下面的核对查询，"+
 		"并用 SHOW CREATE TABLE %s 逐项对照，RENAME 之后人工重建", backup, backup, table)
 	fmt.Fprintf(b, "\n  3) 按下面的建表语句建影子表 %s，把数据拷进去（旧形态列的 NULL 改写成 ''）", shadow)
 	if len(preserved) > 0 {
 		fmt.Fprintf(b, "\n     影子表保留了线上比 proto 更宽（或排序规则不同）的列，不收窄：%v", preserved)
 	}
+	if len(narrowed) > 0 {
+		fmt.Fprintf(b, "\n     为了不超过单个索引 %d 字节的上限（建表会报 Error 1071），这些键列**按 proto 宽度重建**、"+
+			"没有沿用线上更宽的定义：%v；超长的值在严格模式下是报错中断而不是静默截断，"+
+			"核对查询里的 max_chars/max_bytes 就是用来提前发现它们的", MaxIndexKeyBytes, narrowed)
+	}
 	if len(keptNames) > 0 {
 		fmt.Fprintf(b, "\n     影子表按线上定义带上了本库未声明的索引 %v（只还原唯一性、列顺序与前缀长度；"+
-			"FULLTEXT/SPATIAL、降序、不可见等属性请按 SHOW CREATE TABLE 的输出人工核对）", keptNames)
+			"降序、不可见等属性请按 SHOW CREATE TABLE 的输出人工核对）", keptNames)
 	}
 	if m.autoIncreaseKey != "" {
 		fmt.Fprintf(b, "\n  4) 把影子表的自增计数器抬到旧表的水位（SQL 块里已包含）："+
@@ -636,6 +711,18 @@ func (m *MessageTable) legacyKeyRebuildSQL(
 	statements = append(statements, fmt.Sprintf("RENAME TABLE %s TO %s, %s TO %s", table, backup, shadow, table))
 
 	checks = m.legacyValueCheckSQL(legacy)
+	// 被退回 proto 宽度的键列也要看有没有装不下的值：它们的线上形态本身是对的（不在 legacy 里），
+	// 但影子表比线上窄，超长的行会让拷贝报错中断。
+	for _, name := range narrowedNames {
+		column := columns[name]
+		if column.legacy || !column.exists {
+			continue
+		}
+		checks = append(checks, m.keyValueCheckSQL(m.Descriptor.Fields().ByName(protoreflect.Name(name)), column.onlineName))
+	}
+	if len(notNullGaps) > 0 {
+		checks = append(checks, m.notNullGapCheckSQL(notNullGaps))
+	}
 	checks = append(checks,
 		fmt.Sprintf("SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME "+
 			"FROM information_schema.REFERENTIAL_CONSTRAINTS "+
@@ -644,7 +731,40 @@ func (m *MessageTable) legacyKeyRebuildSQL(
 		fmt.Sprintf("SELECT TRIGGER_NAME, ACTION_TIMING, EVENT_MANIPULATION FROM information_schema.TRIGGERS "+
 			"WHERE TRIGGER_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = %s", quoteSQLLiteral(m.tableName)),
 	)
-	return checks, statements
+	return checks, statements, nil
+}
+
+// legacyNotNullGap 线上可空、影子表按 proto 是 NOT NULL 的一列。
+type legacyNotNullGap struct {
+	onlineName string
+	colType    string // 影子表里的列定义，里面的 DEFAULT 就是人工回填时该用的值
+}
+
+// notNullGapCheckSQL 这些列各有多少行是 NULL。一条查询查完所有列：分开查只是多跑几遍全表。
+// 别名用线上列名加后缀，超长时按标识符上限截断（MySQL 的别名同样受 64 字符限制）。
+func (m *MessageTable) notNullGapCheckSQL(gaps []legacyNotNullGap) string {
+	sums := make([]string, 0, len(gaps))
+	for _, gap := range gaps {
+		sums = append(sums, fmt.Sprintf("SUM(%s IS NULL) AS %s", escapeMySQLName(gap.onlineName),
+			escapeMySQLName(truncateIdentifier(gap.onlineName+"_null_rows"))))
+	}
+	return fmt.Sprintf("SELECT %s, COUNT(*) AS rows_total FROM %s /* 影子表里这些列是 NOT NULL，非零必须先人工回填，否则拷贝报 Error 1048 */",
+		strings.Join(sums, ", "), escapeMySQLName(m.tableName))
+}
+
+// formatShadowColumnList 把列表渲染成 "`列名` 影子表里的定义"，供迁移步骤点名。
+func formatShadowColumnList(gaps []legacyNotNullGap) []string {
+	out := make([]string, 0, len(gaps))
+	for _, gap := range gaps {
+		out = append(out, fmt.Sprintf("%s %s", escapeMySQLName(gap.onlineName), gap.colType))
+	}
+	return out
+}
+
+// shadowColumnIsNotNull 影子表里这一列的定义带不带 NOT NULL。列定义由 getMySQLFieldType /
+// alignedColumnType 产出，NOT NULL 只可能来自它们。
+func shadowColumnIsNotNull(colType string) bool {
+	return strings.Contains(strings.ToUpper(colType), "NOT NULL")
 }
 
 func boolToInt(b bool) int {
@@ -676,6 +796,87 @@ func (m *MessageTable) preservedShadowColumns(columns map[string]shadowColumn) [
 		preserved = append(preserved, fmt.Sprintf("%s %s", escapeMySQLName(string(field.Name())), column.colType))
 	}
 	return preserved
+}
+
+// shrinkShadowKeysToIndexBudget 影子表保留线上更宽的键列之后，**本库声明的**主键/唯一键/索引
+// 可能超过 MaxIndexKeyBytes，建表直接报 Error 1071（MySQL 只说上限、TiDB 会把实际字节数一起报）。
+//
+// 这条键此前没人复核：注册期的 validateIndexKeyBytes 只按 proto 类型算，看不见"保留线上更宽的列"
+// 这一步；shadowExtraIndexes 的预算检查只覆盖线上未声明的索引。实测线上 varchar(768) 键列 +
+// proto max_length=191 的联合主键就会产出一条必然 1071 的 DDL。
+//
+// 超预算时把这条键里保留了线上宽度的**键列**（string/bytes，宽度由 max_length 决定、整列进索引）
+// 按声明顺序逐个退回 proto 目标宽度，退到进预算为止。只退键列：数值列收窄省不下几个字节，
+// 却会把超出值域的行挡在拷贝之外。退回之后每条键的键长就等于注册期算过的那个数，因而必在预算内。
+// 返回被退回的列名（proto 名字，按 proto 字段顺序去重），供迁移步骤点名与补核对查询。
+func (m *MessageTable) shrinkShadowKeysToIndexBudget(columns map[string]shadowColumn) []string {
+	keys := make([][]string, 0, len(m.indexes)+2)
+	if len(m.primaryKey) > 0 {
+		keys = append(keys, m.primaryKey)
+	}
+	if m.uniqueKeys != "" {
+		keys = append(keys, splitTrimmed(m.uniqueKeys))
+	}
+	for _, spec := range m.indexes {
+		keys = append(keys, splitTrimmed(spec))
+	}
+
+	shrunk := make(map[string]struct{})
+	for _, key := range keys {
+		for _, name := range key {
+			if bytes, known := m.shadowKeyBytes(columns, key); !known || bytes <= MaxIndexKeyBytes {
+				break
+			}
+			field := m.fieldNameToDesc[name]
+			if _, isKey := m.keyColumnKind(field); !isKey {
+				continue
+			}
+			column, ok := columns[name]
+			target := m.getMySQLFieldType(field)
+			if !ok || column.colType == target {
+				continue
+			}
+			column.colType = target
+			columns[name] = column
+			shrunk[name] = struct{}{}
+		}
+	}
+	if len(shrunk) == 0 {
+		return nil
+	}
+
+	var narrowed []string
+	fields := m.Descriptor.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		name := string(fields.Get(i).Name())
+		if _, ok := shrunk[name]; ok {
+			narrowed = append(narrowed, name)
+		}
+	}
+	return narrowed
+}
+
+// shadowKeyBytes 影子表里这条键占的字节数；有一列判不出类型时返回 false（不做预算判断）。
+// 前缀长度必须按 m.indexColumn 实际会写进 DDL 的那个算（TEXT/BLOB 目标列补 TextIndexPrefixLength，
+// 键列整列），否则算出来的数字与建表语句对不上。
+func (m *MessageTable) shadowKeyBytes(columns map[string]shadowColumn, key []string) (int, bool) {
+	total := 0
+	for _, name := range key {
+		column, ok := columns[name]
+		if !ok {
+			return 0, false
+		}
+		var subPart sql.NullInt64
+		if m.needsIndexPrefix(name) {
+			subPart = sql.NullInt64{Int64: TextIndexPrefixLength, Valid: true}
+		}
+		n, known := shadowIndexPartBytes(column.colType, subPart)
+		if !known {
+			return 0, false
+		}
+		total += n
+	}
+	return total, true
 }
 
 // autoIncrementRebaseSQL 把影子表的自增计数器抬到不低于旧表的计数器，放在 INSERT 之后、RENAME 之前。
@@ -710,8 +911,16 @@ func (m *MessageTable) autoIncrementRebaseSQL(shadow string) []string {
 //
 // 不带上它们的话，RENAME 之后这些索引就没了——DBA 按查询模式加的索引、别的工具建的唯一约束
 // 都会静默消失，而本库对线上多出来的索引一贯是"只加不删"。
-// 旧形态键列上的前缀长度必须去掉：这些列在影子表里是 VARCHAR/VARBINARY 整列索引，
-// 前缀长度大于等于列宽时建表直接报 Error 1089。其余 TEXT/BLOB 列保留线上的 SUB_PART。
+//
+// 前缀长度按**影子表里这一列的实际定义**重新判，不能照抄线上的 SUB_PART：
+//   - 旧形态键列的前缀长度必须去掉：它在影子表里是 VARCHAR/VARBINARY 整列，前缀长度 ≥ 列宽报 Error 1089；
+//   - 线上是整列索引（SUB_PART 为 NULL）而影子表里这一列是 TEXT/BLOB 时必须补前缀：
+//     线上 nick varchar(64) + KEY idx_nick(nick) 这种，proto 里 nick 是非键 string，影子表里就是
+//     MEDIUMTEXT，照抄成裸列名的 DDL 建不了表（Error 1170）；
+//   - 其余情况保留线上的 SUB_PART。
+//
+// FULLTEXT/SPATIAL 一律不还原：本库只会按唯一性生成 INDEX / UNIQUE KEY，重建出来的是 BTREE，
+// RENAME 之后 MATCH ... AGAINST 报 Error 1191，而索引名已被占用，人工重建还要先改名。
 func (m *MessageTable) shadowExtraIndexes(
 	columns map[string]shadowColumn, existingIndexes map[string]indexMeta, indexesKnown bool,
 ) (clauses []string, kept []string, lost []string) {
@@ -744,6 +953,12 @@ func (m *MessageTable) shadowExtraIndexes(
 
 	for _, name := range names {
 		meta := existingIndexes[name]
+		if !shadowRebuildableIndexType(meta.indexType) {
+			lost = append(lost, fmt.Sprintf("%s %s：索引类型是 %s，本库不还原（当普通索引重建只会得到一条 BTREE，"+
+				"全文/空间检索失效且索引名被占用），请按 SHOW CREATE TABLE 的输出人工补",
+				name, formatIndexMeta(meta), meta.indexType))
+			continue
+		}
 		parts := append([]indexColumnMeta(nil), meta.columns...)
 		sort.Slice(parts, func(i, j int) bool { return parts[i].sequence < parts[j].sequence })
 
@@ -758,8 +973,11 @@ func (m *MessageTable) shadowExtraIndexes(
 			}
 			column := columns[fieldName]
 			subPart := part.subPart
-			if column.legacy {
+			switch {
+			case column.legacy:
 				subPart = sql.NullInt64{} // 整列索引，前缀长度在 VARCHAR/VARBINARY 上不再成立
+			case !subPart.Valid && shadowNeedsIndexPrefix(column.colType):
+				subPart = sql.NullInt64{Int64: TextIndexPrefixLength, Valid: true}
 			}
 			escaped := escapeMySQLName(fieldName)
 			if subPart.Valid {
@@ -773,7 +991,7 @@ func (m *MessageTable) shadowExtraIndexes(
 			}
 		}
 		if reason == "" && budgetKnown && bytes > MaxIndexKeyBytes {
-			reason = fmt.Sprintf("去掉旧形态键列的前缀长度后键长 %d 字节，超过单个索引 %d 字节的上限（建表会报 Error 1071）",
+			reason = fmt.Sprintf("按影子表的列定义算，键长 %d 字节，超过单个索引 %d 字节的上限（建表会报 Error 1071）",
 				bytes, MaxIndexKeyBytes)
 		}
 		if reason != "" {
@@ -788,6 +1006,32 @@ func (m *MessageTable) shadowExtraIndexes(
 		kept = append(kept, name)
 	}
 	return clauses, kept, lost
+}
+
+// shadowRebuildableIndexType 影子表只还原普通索引：BTREE / HASH。
+// FULLTEXT / SPATIAL / RTREE 等一律交人工（见 shadowExtraIndexes 的注释）。
+// 空串表示这条元数据没带 INDEX_TYPE（读线上索引的查询一定会带，只有手工构造的 indexMeta 才会空），
+// 按普通索引处理，与加这个字段之前的行为一致。
+func shadowRebuildableIndexType(indexType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(indexType)) {
+	case "", "BTREE", "HASH":
+		return true
+	}
+	return false
+}
+
+// shadowNeedsIndexPrefix 影子表里这一列的定义是不是 TEXT/BLOB 系——MySQL 不允许在这类列上建
+// 不带前缀长度的索引（Error 1170）。判据与 m.needsIndexPrefix 同一口径，区别只在于按影子表的
+// 实际列定义判，而不是按 proto 目标类型：线上 varchar(64) 的非键列在影子表里会被拓宽成 MEDIUMTEXT。
+func shadowNeedsIndexPrefix(colType string) bool {
+	if TextIndexPrefixLength <= 0 {
+		return false
+	}
+	switch normalizeBaseType(parseMySQLType(colType).baseType) {
+	case "tinytext", "text", "mediumtext", "longtext", "tinyblob", "blob", "mediumblob", "longblob":
+		return true
+	}
+	return false
 }
 
 // shadowIndexPartBytes 影子表里这一列在索引键里占的字节数；类型无法判断时返回 false（不做预算判断）。

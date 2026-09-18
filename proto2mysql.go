@@ -1874,10 +1874,17 @@ type indexColumnMeta struct {
 
 // indexMeta 是本库当前支持校验的索引定义维度。只保留名字远远不够：同名索引可能在
 // 唯一性、列顺序或 TEXT/BLOB 前缀长度上与 proto 声明不一致。
-// MySQL 8 的 IS_VISIBLE、INDEX_TYPE 与升降序目前不在跨 5.7 的查询契约内，见审计文档。
+// MySQL 8 的 IS_VISIBLE 与升降序目前不在跨 5.7 的查询契约内，见审计文档。
 type indexMeta struct {
 	unique  bool
 	columns []indexColumnMeta
+	// indexType 是 INFORMATION_SCHEMA.STATISTICS.INDEX_TYPE（BTREE/HASH/FULLTEXT/SPATIAL，MySQL 5.7 起就有）。
+	//
+	// ⚠️ 只给影子表重建这一条路径用（见 shadowExtraIndexes）：本库从不声明 FULLTEXT/SPATIAL，
+	// 把它们当普通索引重建会静默降级成 BTREE，RENAME 之后 MATCH ... AGAINST 报 Error 1191。
+	// 刻意**不进** indexMetaEqual / formatIndexMeta：那两处是拿线上索引与 proto 声明做比对的，
+	// proto 侧根本没有这个维度，一比就会把线上既有的普通索引判成漂移。
+	indexType string
 }
 
 // lookupIndexMeta 按 MySQL 的索引名语义查找，同时保留 information_schema 返回的
@@ -1918,10 +1925,15 @@ func hasIndexName(indexes map[string][]string, name string) bool {
 //
 // 所以把唯一性、列顺序和前缀长度一起读回来做 fail-closed 比对；错配时绝不自动
 // DROP/重建索引（那是破坏性操作，且在滚动发布下会被新旧副本来回执行）。
+//
+// indexMetaColumnsSQL 是二级索引与主键两条查询共用的列，写在一处是为了两边不会各自漂移。
+// INDEX_TYPE 在 MySQL 5.7 与 TiDB 上都有，加它不破坏跨版本的查询契约。
+const indexMetaColumnsSQL = "INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART, INDEX_TYPE"
+
 func (p *DB) existingIndexNames(tableName string) (map[string]indexMeta, error) {
 	rows, err := p.meta().QueryContext(p.context(),
-		"SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART "+
-			"FROM INFORMATION_SCHEMA.STATISTICS "+
+		"SELECT "+indexMetaColumnsSQL+
+			" FROM INFORMATION_SCHEMA.STATISTICS "+
 			"WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME <> 'PRIMARY' "+
 			"ORDER BY INDEX_NAME, SEQ_IN_INDEX",
 		p.DBName, tableName)
@@ -1934,9 +1946,9 @@ func (p *DB) existingIndexNames(tableName string) (map[string]indexMeta, error) 
 	for rows.Next() {
 		var name string
 		var nonUnique, sequence int
-		var column sql.NullString
+		var column, indexType sql.NullString
 		var subPart sql.NullInt64
-		if err := rows.Scan(&name, &nonUnique, &sequence, &column, &subPart); err != nil {
+		if err := rows.Scan(&name, &nonUnique, &sequence, &column, &subPart, &indexType); err != nil {
 			return nil, fmt.Errorf("scan index metadata for table %s: %w", tableName, err)
 		}
 		if name == "" {
@@ -1948,6 +1960,7 @@ func (p *DB) existingIndexNames(tableName string) (map[string]indexMeta, error) 
 			return nil, fmt.Errorf("index metadata for table %s index %s has inconsistent NON_UNIQUE values", tableName, name)
 		}
 		meta.unique = unique
+		meta.indexType = indexType.String
 		meta.columns = append(meta.columns, indexColumnMeta{
 			name:     column.String,
 			sequence: sequence,
@@ -1966,8 +1979,8 @@ func (p *DB) existingIndexNames(tableName string) (map[string]indexMeta, error) 
 // 因此这里与二级索引一样从 STATISTICS 读取。
 func (p *DB) primaryKeyMetadata(tableName string) (*indexMeta, error) {
 	rows, err := p.meta().QueryContext(p.context(),
-		"SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART "+
-			"FROM INFORMATION_SCHEMA.STATISTICS "+
+		"SELECT "+indexMetaColumnsSQL+
+			" FROM INFORMATION_SCHEMA.STATISTICS "+
 			"WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY' "+
 			"ORDER BY SEQ_IN_INDEX", p.DBName, tableName)
 	if err != nil {
@@ -1979,9 +1992,9 @@ func (p *DB) primaryKeyMetadata(tableName string) (*indexMeta, error) {
 	for rows.Next() {
 		var name string
 		var nonUnique, sequence int
-		var col sql.NullString
+		var col, indexType sql.NullString
 		var subPart sql.NullInt64
-		if err := rows.Scan(&name, &nonUnique, &sequence, &col, &subPart); err != nil {
+		if err := rows.Scan(&name, &nonUnique, &sequence, &col, &subPart, &indexType); err != nil {
 			return nil, fmt.Errorf("scan primary key metadata for table %s: %w", tableName, err)
 		}
 		unique := nonUnique == 0
@@ -1990,6 +2003,7 @@ func (p *DB) primaryKeyMetadata(tableName string) (*indexMeta, error) {
 		} else if primary.unique != unique {
 			return nil, fmt.Errorf("primary key metadata for table %s has inconsistent NON_UNIQUE values", tableName)
 		}
+		primary.indexType = indexType.String
 		primary.columns = append(primary.columns, indexColumnMeta{
 			name:     col.String,
 			sequence: sequence,

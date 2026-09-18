@@ -260,14 +260,20 @@ func fakeColumnCollation(colType string) driver.Value {
 	return nil
 }
 
-// indexRow 造一行 information_schema.STATISTICS 的结果，列序与 core 查询一致。
+// indexRow 造一行 information_schema.STATISTICS 的结果，列序与 core 查询一致（indexMetaColumnsSQL）。
 // subPart 传 nil 表示整列索引；TEXT/BLOB 前缀索引传 int64(TextIndexPrefixLength)。
+// 索引类型默认 BTREE，FULLTEXT/SPATIAL 用 indexRowTyped。
 func indexRow(name string, unique bool, sequence int, column string, subPart driver.Value) []driver.Value {
+	return indexRowTyped(name, unique, sequence, column, subPart, "BTREE")
+}
+
+// indexRowTyped 同 indexRow，但能指定 INDEX_TYPE。
+func indexRowTyped(name string, unique bool, sequence int, column string, subPart driver.Value, indexType string) []driver.Value {
 	nonUnique := int64(1)
 	if unique {
 		nonUnique = 0
 	}
-	return row(name, nonUnique, int64(sequence), column, subPart)
+	return row(name, nonUnique, int64(sequence), column, subPart, indexType)
 }
 
 // newFakeDB 建一个绑定假连接的 *DB，并注册 GolangTest。

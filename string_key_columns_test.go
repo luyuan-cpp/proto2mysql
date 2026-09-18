@@ -1353,6 +1353,251 @@ func TestLegacyRebuildRejectsUndeclaredIndexOverBudget(t *testing.T) {
 	assertContainsAll(t, err.Error(), "无法自动重建", "idx_manual_wide", "键长 6144 字节", "Error 1071")
 }
 
+// TestLegacyRebuildAddsPrefixToWidenedTextIndexColumn 线上的整列索引（SUB_PART 为 NULL）建在一列
+// 会被拓宽成 MEDIUMTEXT/MEDIUMBLOB 的列上时，影子表必须按**影子表里的列定义**补前缀长度：
+// 照抄成裸列名的建表语句会报 Error 1170（真库实测，MySQL 与 TiDB 同）。
+func TestLegacyRebuildAddsPrefixToWidenedTextIndexColumn(t *testing.T) {
+	md := keyProbeDescriptor(t, "text_prefix_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "nick", typ: probeString},
+		keyProbeField{name: "avatar", typ: probeBytes},
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"), // 旧形态主键
+		colRowFull("nick", "varchar(64)", 2, true, "", nil, "utf8mb4_unicode_ci"),  // 影子表里是 MEDIUMTEXT
+		colRowFull("avatar", "varbinary(64)", 3, true, "", nil, nil),               // 影子表里是 MEDIUMBLOB
+	)
+	indexes := rows(
+		indexRow("idx_manual_nick", false, 1, "nick", nil),    // 线上整列索引：varchar(64) 上不需要前缀
+		indexRow("uk_manual_avatar", true, 1, "avatar", nil),
+	)
+	err, _ := legacyRebuildSync(t, msg, cols, indexes, rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("text_prefix_probe"), WithPrimaryKey("sub"))
+
+	assertContainsAll(t, legacyStatements(t, err)[1],
+		"`nick` MEDIUMTEXT COMMENT 'pb:2'",
+		"`avatar` MEDIUMBLOB COMMENT 'pb:3'",
+		"INDEX `idx_manual_nick` (`nick`(191))",
+		"UNIQUE KEY `uk_manual_avatar` (`avatar`(191))",
+	)
+}
+
+// TestLegacyRebuildCountsAddedPrefixInIndexBudget 补出来的前缀长度必须参与 3072 字节预算：
+// 算不出字节数时预算闸会被短路，连"点名为无法重建"都不会发生。
+func TestLegacyRebuildCountsAddedPrefixInIndexBudget(t *testing.T) {
+	md := keyProbeDescriptor(t, "prefix_budget_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "nick", typ: probeString},
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(768)", 1, false, "", nil, "utf8mb4_unicode_ci"),
+		colRowFull("nick", "varchar(64)", 2, true, "", nil, "utf8mb4_unicode_ci"),
+	)
+	// 两列在线上都是整列索引：sub 在影子表里是 VARCHAR(768)（3072 字节），nick 是 MEDIUMTEXT（前缀 191×4）
+	indexes := rows(
+		indexRow("idx_manual_sub_nick", false, 1, "sub", nil),
+		indexRow("idx_manual_sub_nick", false, 2, "nick", nil),
+	)
+	err, _ := legacyRebuildSync(t, msg, cols, indexes, rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("prefix_budget_probe"), WithPrimaryKey("sub"), WithMaxLength("sub", MaxKeyStringLength))
+
+	if create := legacyStatements(t, err)[1]; strings.Contains(create, "idx_manual_sub_nick") {
+		t.Errorf("超过索引字节预算的索引不能进建表语句: %s", create)
+	}
+	assertContainsAll(t, err.Error(), "无法自动重建", "idx_manual_sub_nick", "键长 3836 字节", "Error 1071")
+}
+
+// TestLegacyRebuildNamesNullableColumnsGoingNotNull 线上可空、按 proto 在影子表里是 NOT NULL 的
+// 非键列：本库不替它们改写数据（NULL 与 0 语义不同），但必须点名并给出核对查询——
+// 否则整表拷贝会在 Error 1048 上白跑，前面建表那几步全废。
+func TestLegacyRebuildNamesNullableColumnsGoingNotNull(t *testing.T) {
+	md := keyProbeDescriptor(t, "not_null_gap_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "cnt", typ: probeInt32},
+		keyProbeField{name: "note", typ: probeString},
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"),
+		colRowAttrsDefault("cnt", "int", 2, true, "", nil), // 线上 int DEFAULT NULL，proto 要 NOT NULL
+		colRow("note", "mediumtext", 3),                    // 两侧都可空：不该点名
+	)
+	err, _ := legacyRebuildSync(t, msg, cols, nil, rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("not_null_gap_probe"), WithPrimaryKey("sub"))
+
+	insert := legacyStatements(t, err)[2]
+	assertContainsAll(t, insert, "SELECT `sub`, `cnt`, `note` FROM `not_null_gap_probe`")
+	if strings.Contains(insert, "COALESCE(`cnt`") {
+		t.Errorf("非键列不该被默默改写成默认值: %s", insert)
+	}
+	assertContainsAll(t, err.Error(), "`cnt` int NOT NULL DEFAULT 0", "人工回填", "Error 1048")
+	checks := strings.Join(legacyChecks(t, err), "\n")
+	assertContainsAll(t, checks, "SUM(`cnt` IS NULL) AS `cnt_null_rows`")
+	if strings.Contains(checks, "`note` IS NULL") {
+		t.Errorf("proto 侧同样可空的列不该被点名:\n%s", checks)
+	}
+}
+
+// TestLegacyRebuildClaimsEachOnlineColumnOnce 同一个线上列不能被两个 proto 字段同时当成源列：
+// 线上 name 带 COMMENT 'pb:2'，proto 把 2 号字段改名成 nickname 又新增一个叫 name 的字段时，
+// 没有 remaining 记账就会产出 SELECT `name`, `name`——新字段被灌进旧数据，同族时静默错数据。
+func TestLegacyRebuildClaimsEachOnlineColumnOnce(t *testing.T) {
+	md := keyProbeDescriptor(t, "claim_once_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "nickname", typ: probeString}, // pb:2：线上那列改名后的新名字
+		keyProbeField{name: "name", typ: probeString},     // pb:3：新增字段，名字恰好等于线上列名
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"),
+		colRow("name", "mediumtext", 2),
+	)
+	err, _ := legacyRebuildSync(t, msg, cols, nil, rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("claim_once_probe"), WithPrimaryKey("sub"))
+
+	insert := legacyStatements(t, err)[2]
+	// 列名匹配优先（与 buildColumnClauses 一致）：线上 name 归新字段 name，nickname 没有源列
+	want := "INSERT INTO `claim_once_probe__p2m_new` (`sub`, `name`) SELECT `sub`, `name` FROM `claim_once_probe`"
+	if insert != want {
+		t.Fatalf("同一个线上列被认领了两次\n got: %s\nwant: %s", insert, want)
+	}
+	if strings.Contains(err.Error(), "proto 未声明的列") {
+		t.Errorf("线上 name 已被认领，不该再报成孤儿列: %v", err)
+	}
+
+	// 大小写折叠后有多个候选时，与主路径一样 fail-closed，不猜哪一列是真实数据
+	table := newMessageTable(msg, WithTableName("claim_once_probe"), WithPrimaryKey("sub"))
+	if _, ambiguous := table.shadowColumns(nil, map[string]columnMeta{
+		"Name": {colType: "mediumtext", fieldNum: 3, metadataComplete: true},
+		"name": {colType: "mediumtext", fieldNum: 2, metadataComplete: true},
+	}); !errors.Is(ambiguous, ErrSchemaDrift) {
+		t.Fatalf("列身份歧义必须 fail-closed，实际: %v", ambiguous)
+	}
+}
+
+// TestLegacyRebuildRefusesFulltextIndex FULLTEXT/SPATIAL 不能当普通索引重建：本库只会按唯一性
+// 生成 INDEX / UNIQUE KEY，重建出来的是 BTREE，RENAME 之后 MATCH ... AGAINST 报 Error 1191，
+// 而索引名已被占用，人工重建还得先改名。
+func TestLegacyRebuildRefusesFulltextIndex(t *testing.T) {
+	md := keyProbeDescriptor(t, "fulltext_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "body", typ: probeString},
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"),
+		colRow("body", "mediumtext", 2),
+	)
+	// FULLTEXT 的 SUB_PART 恒为 NULL：不点名的话要么撞 Error 1170，要么被静默降级成 BTREE
+	indexes := rows(indexRowTyped("ft_manual_body", false, 1, "body", nil, "FULLTEXT"))
+	err, _ := legacyRebuildSync(t, msg, cols, indexes, rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("fulltext_probe"), WithPrimaryKey("sub"))
+
+	if create := legacyStatements(t, err)[1]; strings.Contains(create, "ft_manual_body") {
+		t.Errorf("FULLTEXT 索引不能出现在影子表的建表语句里: %s", create)
+	}
+	assertContainsAll(t, err.Error(), "无法自动重建", "ft_manual_body", "FULLTEXT", "人工补")
+	if strings.Contains(err.Error(), "影子表按线上定义带上了本库未声明的索引") {
+		t.Errorf("这张表上唯一的未声明索引是 FULLTEXT，文案不能说已经带上了: %v", err)
+	}
+}
+
+// TestOnlineIndexTypeDoesNotCauseDrift indexMeta 多出 INDEX_TYPE 之后，普通表的同步不得因此把
+// 线上既有索引判成漂移：那个字段只给影子表重建用，proto 侧根本没有这个维度。
+func TestOnlineIndexTypeDoesNotCauseDrift(t *testing.T) {
+	online := indexMeta{unique: true, indexType: "FULLTEXT",
+		columns: []indexColumnMeta{{name: "note", sequence: 1}}}
+	want := indexMeta{unique: true, columns: []indexColumnMeta{{name: "note", sequence: 1}}}
+	if !indexMetaEqual(online, want) {
+		t.Error("INDEX_TYPE 不参与索引比较")
+	}
+	if formatIndexMeta(online) != formatIndexMeta(want) {
+		t.Errorf("漂移文本不该出现 INDEX_TYPE: %s", formatIndexMeta(online))
+	}
+
+	md := keyTableProbe(t)
+	msg := dynamicpb.NewMessage(md)
+	pdb, conn := newKeyProbeDB(t, msg, WithTableName("key_sync_probe"), WithPrimaryKey("sub"),
+		WithUniqueKey("provider,token"), WithIndexes("note", "sub,id"), WithMaxLength("sub", 64))
+	cols, indexes, primary := keyTableAlignedSnapshot()
+	for i := range indexes {
+		indexes[i][5] = "HASH" // 线上的索引类型与 BTREE 不同（MEMORY 引擎、手工建的哈希索引）
+	}
+
+	queueLockedSchemaSync(conn, rows(row(int64(1))), cols, indexes, primary)
+	if err := pdb.CreateOrUpdateTable(msg); err != nil {
+		t.Fatalf("INDEX_TYPE 不该参与漂移判断: %v", err)
+	}
+	if n := conn.countSQL("ALTER TABLE"); n != 0 {
+		t.Fatalf("不得因 INDEX_TYPE 产生 ALTER，实际: %v", conn.sqls())
+	}
+}
+
+// TestLegacyRebuildShrinksDeclaredKeyToIndexBudget 影子表保留线上更宽的键列之后，**声明的**
+// 主键/唯一键也可能超过 3072 字节（实测 MySQL 报 1071、TiDB 报 1071 (6144 bytes)）。
+// 注册期的校验只按 proto 类型算，看不见这一步，所以必须在建表前按影子表的列定义复核。
+func TestLegacyRebuildShrinksDeclaredKeyToIndexBudget(t *testing.T) {
+	md := keyProbeDescriptor(t, "key_budget_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "provider", typ: probeString},
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(768)", 1, false, "", nil, "utf8mb4_unicode_ci"),   // 旧形态（*_ci）
+		colRowFull("provider", "varchar(768)", 2, false, "", "", KeyStringCollation), // 形态对，只是更宽
+	)
+	primary := rows(
+		indexRow("PRIMARY", true, 1, "sub", nil),
+		indexRow("PRIMARY", true, 2, "provider", nil),
+	)
+	err, _ := legacyRebuildSync(t, msg, cols, nil, primary,
+		WithTableName("key_budget_probe"), WithPrimaryKey("sub", "provider"))
+
+	create := legacyStatements(t, err)[1]
+	assertContainsAll(t, create,
+		"`sub` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:1'",
+		"`provider` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:2'",
+		"PRIMARY KEY (`sub`,`provider`)",
+	)
+	if strings.Contains(create, "varchar(768)") {
+		t.Errorf("超预算的键列必须退回 proto 宽度，否则建表必报 Error 1071: %s", create)
+	}
+	assertContainsAll(t, err.Error(), "按 proto 宽度重建", "Error 1071",
+		"`provider` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''")
+	// 退回宽度之后线上的超长值装不下，必须有核对查询能提前发现
+	assertContainsAll(t, strings.Join(legacyChecks(t, err), "\n"), "MAX(CHAR_LENGTH(`provider`)) AS max_chars")
+}
+
+// TestLegacyRebuildKeepsUndeclaredIndexOnRenamedColumn 列被改过名（按 COMMENT 'pb:N' 认出来）
+// 且该列上带着本库未声明的索引：索引要按 proto 的新列名重建，而 INSERT ... SELECT 的源列仍是线上名字。
+func TestLegacyRebuildKeepsUndeclaredIndexOnRenamedColumn(t *testing.T) {
+	md := keyProbeDescriptor(t, "rename_index_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "id", typ: probeUint64},
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub_old", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"),
+		colRow("id", "bigint unsigned", 2),
+	)
+	// STATISTICS 里的列名大小写与列定义不同：fieldByOnlineName 必须按 MySQL 语义归一化后匹配
+	indexes := rows(
+		indexRow("idx_manual", false, 1, "SUB_OLD", int64(TextIndexPrefixLength)),
+		indexRow("idx_manual", false, 2, "id", nil),
+	)
+	err, _ := legacyRebuildSync(t, msg, cols, indexes, rows(indexRow("PRIMARY", true, 1, "sub_old", nil)),
+		WithTableName("rename_index_probe"), WithPrimaryKey("sub"))
+
+	statements := legacyStatements(t, err)
+	// 索引用 proto 新名字，旧形态键列上的前缀长度去掉（影子表里已是 VARCHAR 整列）
+	assertContainsAll(t, statements[1], "INDEX `idx_manual` (`sub`,`id`)")
+	assertContainsAll(t, statements[2],
+		"INSERT INTO `rename_index_probe__p2m_new` (`sub`, `id`) SELECT `sub_old`, `id` FROM `rename_index_probe`")
+	assertContainsAll(t, err.Error(), "本库未声明的索引 [idx_manual]")
+}
+
 func TestKeyColumnWideningGeneratesModifyWithCollation(t *testing.T) {
 	md := keyTableProbe(t)
 	msg := dynamicpb.NewMessage(md)

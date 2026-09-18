@@ -321,6 +321,9 @@ func TestLegacyPrimaryKeyMigrationRealDatabase(t *testing.T) {
 		keyProbeField{name: "sub", typ: probeString},
 		keyProbeField{name: "note", typ: probeString},
 		keyProbeField{name: "count", typ: probeInt32},
+		// nick 线上是 varchar(64)、索引是整列（SUB_PART 为 NULL），而它不在任何键里，
+		// proto 映射成 MEDIUMTEXT——影子表这一列会被拓宽，索引照抄成裸列名的话建表报 Error 1170。
+		keyProbeField{name: "nick", typ: probeString},
 	)
 	const table = "p2m_legacy_pk_probe"
 	const wideValue int64 = 9999999999 // 超出 int32
@@ -332,14 +335,16 @@ func TestLegacyPrimaryKeyMigrationRealDatabase(t *testing.T) {
 
 	if _, err := db.Exec("CREATE TABLE `" + table + "` (" +
 		"`sub` varchar(191) NOT NULL COMMENT 'pb:1', `note` MEDIUMTEXT COMMENT 'pb:2', " +
-		"`count` bigint NOT NULL DEFAULT 0 COMMENT 'pb:3', PRIMARY KEY (`sub`), " +
-		"UNIQUE KEY `uk_manual_note` (`note`(191)), KEY `idx_manual_count` (`count`)" +
+		"`count` bigint NOT NULL DEFAULT 0 COMMENT 'pb:3', `nick` varchar(64) NOT NULL DEFAULT '' COMMENT 'pb:4', " +
+		"PRIMARY KEY (`sub`), " +
+		"UNIQUE KEY `uk_manual_note` (`note`(191)), KEY `idx_manual_count` (`count`), " +
+		"KEY `idx_manual_nick` (`nick`)" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
 		t.Fatalf("建旧形态表: %v", err)
 	}
 	// wide 行的 count 超出 int32，只能用裸 SQL 读回（本库解析 int32 字段时会拒绝它，这正是"线上更宽"的含义）
-	if _, err := db.Exec("INSERT INTO `"+table+"` (`sub`, `note`, `count`) VALUES ('AbC', 'x', 7), ('wide', 'w', ?)",
-		wideValue); err != nil {
+	if _, err := db.Exec("INSERT INTO `"+table+"` (`sub`, `note`, `count`, `nick`) "+
+		"VALUES ('AbC', 'x', 7, 'n1'), ('wide', 'w', ?, 'n2')", wideValue); err != nil {
 		t.Fatalf("写旧数据: %v", err)
 	}
 	if _, err := db.Exec("INSERT INTO `" + table + "` (`sub`, `note`) VALUES ('abc', 'y')"); err == nil {
@@ -353,6 +358,8 @@ func TestLegacyPrimaryKeyMigrationRealDatabase(t *testing.T) {
 	for index, want := range map[string]string{
 		"uk_manual_note":   "UNIQUE(1:note(191))",
 		"idx_manual_count": "INDEX(1:count)",
+		// 线上是整列索引，影子表这一列被拓宽成 MEDIUMTEXT，所以必须补出 191 前缀才建得出表
+		"idx_manual_nick": "INDEX(1:nick(191))",
 	} {
 		if got := keyProbeIndexDefinition(t, db, table, index); got != want {
 			t.Errorf("迁移后索引 %s = %q, want %q", index, got, want)
@@ -409,6 +416,17 @@ func TestLegacyPrimaryKeyAutoIncrementMigrationRealDatabase(t *testing.T) {
 	}
 	if _, err := db.Exec("INSERT INTO `" + table + "` (`sub`) VALUES ('AbC'), ('def')"); err != nil {
 		t.Fatalf("写旧数据: %v", err)
+	}
+	// 先读一次 information_schema.TABLES.AUTO_INCREMENT，把服务端的统计缓存填上小值。
+	//
+	// 少了这一步，这个用例对迁移块里那条 `SET SESSION information_schema_stats_expiry = 0`
+	// 是**看不见的**：MySQL 8 的缓存在首次读取时才填充，从没读过就天然新鲜，把那条语句删掉
+	// 测试照样绿。真实场景里 DBA 迁移前多半已经看过表状态（缓存默认存 24 小时），
+	// 那时读回的就是陈旧计数器，影子表水位会被定在远低于旧表的值上、RENAME 之后重发已用过的 id。
+	var cachedAutoIncrement sql.NullInt64
+	if err := db.QueryRow("SELECT AUTO_INCREMENT FROM information_schema.TABLES "+
+		"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", table).Scan(&cachedAutoIncrement); err != nil {
+		t.Fatalf("预读旧表计数器（填充统计缓存）: %v", err)
 	}
 	// 把计数器抬高后再插一行、删掉它：这就是"尾部行被删过"的表，MAX(id) 远低于计数器
 	if _, err := db.Exec("ALTER TABLE `" + table + "` AUTO_INCREMENT = 100001"); err != nil {
@@ -486,6 +504,151 @@ func TestLegacyRenamedKeyColumnMigrationRealDatabase(t *testing.T) {
 	}
 	if _, err := db.Exec("SELECT `pid` FROM `" + table + "` LIMIT 1"); err == nil {
 		t.Fatal("旧列名 pid 应已随 CHANGE COLUMN 改掉")
+	}
+}
+
+// TestLegacyPrimaryKeyNullableColumnMigrationRealDatabase 线上可空、按 proto 在影子表里是 NOT NULL 的
+// 非键列：本库不替它改写数据，但必须点名并给出核对查询——否则整表拷贝会在第一行 NULL 上报 Error 1048，
+// 前面建表那几步全白做。人工回填之后，同一块 SQL 必须能一路执行到底。
+func TestLegacyPrimaryKeyNullableColumnMigrationRealDatabase(t *testing.T) {
+	md := keyProbeDescriptor(t, "legacy_pk_nullable_it_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "count", typ: probeInt32}, // proto 目标是 int NOT NULL DEFAULT 0
+	)
+	const table = "p2m_legacy_pk_nullable_probe"
+	shadow, backup := table+"__p2m_new", table+"__p2m_old"
+	msg := dynamicpb.NewMessage(md)
+	pdb, db := openKeyProbeDB(t, msg, WithTableName(table), WithPrimaryKey("sub"))
+	dropKeyProbeTables(t, db, table, shadow, backup)
+	t.Cleanup(func() { dropKeyProbeTables(t, db, table, shadow, backup) })
+
+	if _, err := db.Exec("CREATE TABLE `" + table + "` (" +
+		"`sub` varchar(191) NOT NULL COMMENT 'pb:1', `count` int DEFAULT NULL COMMENT 'pb:2', " +
+		"PRIMARY KEY (`sub`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
+		t.Fatalf("建旧形态表: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO `" + table + "` (`sub`, `count`) VALUES ('AbC', 7), ('null_row', NULL)"); err != nil {
+		t.Fatalf("写旧数据: %v", err)
+	}
+
+	syncErr := pdb.SyncAllTables()
+	if !errors.Is(syncErr, ErrLegacyKeyColumn) {
+		t.Fatalf("旧形态主键必须以 ErrLegacyKeyColumn 拒绝，实际: %v", syncErr)
+	}
+	if !strings.Contains(syncErr.Error(), "`count`") || !strings.Contains(syncErr.Error(), "Error 1048") {
+		t.Fatalf("错误信息必须点名可空转 NOT NULL 的列与 1048 后果，实际:\n%v", syncErr)
+	}
+
+	// 核对查询要能查出这一列有几行 NULL：这正是人工决定怎么回填的依据
+	var nullRows, rowsTotal int64
+	found := false
+	for _, query := range legacyChecks(t, syncErr) {
+		if !strings.Contains(query, "count_null_rows") {
+			continue
+		}
+		if err := db.QueryRow(query).Scan(&nullRows, &rowsTotal); err != nil {
+			t.Fatalf("执行 NOT NULL 缺口核对查询: %v\nSQL: %s", err, query)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("核对查询里必须有一条统计这些列 NULL 行数的，实际:\n%v", legacyChecks(t, syncErr))
+	}
+	if nullRows != 1 || rowsTotal != 2 {
+		t.Fatalf("核对查询结果不对: null_rows=%d rows_total=%d, want 1 / 2", nullRows, rowsTotal)
+	}
+
+	// 不回填就照着执行：拷贝那一步必须失败（这就是"点名"要防的事），且影子表还没接客，丢弃安全
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("取专用连接: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	var copyErr error
+	for _, stmt := range legacyStatements(t, syncErr) {
+		if _, copyErr = conn.ExecContext(context.Background(), stmt); copyErr != nil {
+			break
+		}
+	}
+	if copyErr == nil {
+		t.Fatal("没回填就迁移，INSERT ... SELECT 应当因 NOT NULL 而失败")
+	}
+	if _, err := conn.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+escapeMySQLName(shadow)); err != nil {
+		t.Fatalf("丢弃未接客的影子表: %v", err)
+	}
+
+	// 按提示回填，再整块执行一遍：这次必须一路到底，且零漂移
+	if _, err := db.Exec("UPDATE `" + table + "` SET `count` = 0 WHERE `count` IS NULL"); err != nil {
+		t.Fatalf("人工回填: %v", err)
+	}
+	migrateLegacyKeyTable(t, pdb, db, msg, table)
+	assertKeyColumnShape(t, db, table, "sub", "varchar(191)", KeyStringCollation, "PRIMARY")
+	if n := countKeyProbeRows(t, db, table); n != 2 {
+		t.Fatalf("迁移后行数 = %d, want 2", n)
+	}
+}
+
+// TestLegacyPrimaryKeyFulltextIndexMigrationRealDatabase FULLTEXT 索引不能当普通索引重建：
+// 本库只会按唯一性生成 INDEX / UNIQUE KEY，重建出来是 BTREE，RENAME 之后 MATCH ... AGAINST
+// 报 Error 1191，而索引名已被占用、人工重建还要先改名。所以它必须被逐条点名、不进影子表。
+func TestLegacyPrimaryKeyFulltextIndexMigrationRealDatabase(t *testing.T) {
+	md := keyProbeDescriptor(t, "legacy_pk_fulltext_it_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "note", typ: probeString},
+	)
+	const table = "p2m_legacy_pk_fulltext_probe"
+	shadow, backup := table+"__p2m_new", table+"__p2m_old"
+	msg := dynamicpb.NewMessage(md)
+	pdb, db := openKeyProbeDB(t, msg, WithTableName(table), WithPrimaryKey("sub"))
+	dropKeyProbeTables(t, db, table, shadow, backup)
+	t.Cleanup(func() { dropKeyProbeTables(t, db, table, shadow, backup) })
+
+	if _, err := db.Exec("CREATE TABLE `" + table + "` (" +
+		"`sub` varchar(191) NOT NULL COMMENT 'pb:1', `note` MEDIUMTEXT COMMENT 'pb:2', " +
+		"PRIMARY KEY (`sub`), FULLTEXT KEY `ft_manual_note` (`note`)" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
+		t.Fatalf("建旧形态表: %v", err)
+	}
+	// TiDB 会静默忽略 FULLTEXT（建表成功但 information_schema 里没有这条索引），此时本用例没有意义
+	var fulltextCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS "+
+		"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+		table, "ft_manual_note").Scan(&fulltextCount); err != nil {
+		t.Fatalf("回读 FULLTEXT 索引: %v", err)
+	}
+	if fulltextCount == 0 {
+		t.Skip("这个后端不真正创建 FULLTEXT 索引（TiDB 会静默忽略），跳过")
+	}
+	if _, err := db.Exec("INSERT INTO `" + table + "` (`sub`, `note`) VALUES ('AbC', 'hello world')"); err != nil {
+		t.Fatalf("写旧数据: %v", err)
+	}
+
+	syncErr := pdb.SyncAllTables()
+	if !errors.Is(syncErr, ErrLegacyKeyColumn) {
+		t.Fatalf("旧形态主键必须以 ErrLegacyKeyColumn 拒绝，实际: %v", syncErr)
+	}
+	if !strings.Contains(syncErr.Error(), "ft_manual_note") || !strings.Contains(syncErr.Error(), "FULLTEXT") {
+		t.Fatalf("错误信息必须点名这条不还原的 FULLTEXT 索引，实际:\n%v", syncErr)
+	}
+	for _, stmt := range legacyStatements(t, syncErr) {
+		if strings.Contains(stmt, "CREATE TABLE") && strings.Contains(stmt, "ft_manual_note") {
+			t.Fatalf("FULLTEXT 索引不得进影子表建表语句:\n%s", stmt)
+		}
+	}
+
+	migrateLegacyKeyTable(t, pdb, db, msg, table)
+	assertKeyColumnShape(t, db, table, "sub", "varchar(191)", KeyStringCollation, "PRIMARY")
+	// 迁移后这条索引确实没了（这正是要人工重建的东西），数据仍在
+	if err := db.QueryRow("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS "+
+		"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+		table, "ft_manual_note").Scan(&fulltextCount); err != nil {
+		t.Fatalf("迁移后回读索引: %v", err)
+	}
+	if fulltextCount != 0 {
+		t.Fatalf("FULLTEXT 索引不应被重建（哪怕降级成 BTREE），实际还在")
+	}
+	if n := countKeyProbeRows(t, db, table); n != 1 {
+		t.Fatalf("迁移后行数 = %d, want 1", n)
 	}
 }
 

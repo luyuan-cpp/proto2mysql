@@ -26,6 +26,7 @@ const (
 	probeString = descriptorpb.FieldDescriptorProto_TYPE_STRING
 	probeBytes  = descriptorpb.FieldDescriptorProto_TYPE_BYTES
 	probeUint64 = descriptorpb.FieldDescriptorProto_TYPE_UINT64
+	probeInt32  = descriptorpb.FieldDescriptorProto_TYPE_INT32
 )
 
 type keyProbeField struct {
@@ -280,6 +281,73 @@ func TestWithMaxLengthMergesPerFieldAndOverridesProto(t *testing.T) {
 	}
 }
 
+// TestWithMaxLengthsReplacesWholeSet proto 在唯一键字段上写了 max_length、代码又把键换到别的字段时，
+// 残留的声明会让整张表以 ErrInvalidTableOption 注册失败，而按字段合并的 WithMaxLength 清不掉它
+// （写 0 是越界值，同样被拒）。WithMaxLengths 按 WithNullableFields 的语义整体替换。
+func TestWithMaxLengthsReplacesWholeSet(t *testing.T) {
+	opts := &descriptorpb.FieldOptions{}
+	proto.SetExtension(opts, pbopt.E_MaxLength, uint32(255))
+	md := keyProbeDescriptor(t, "max_lengths_probe",
+		keyProbeField{name: "id", typ: probeUint64},
+		keyProbeField{name: "email", typ: probeString, opts: opts},
+		keyProbeField{name: "name", typ: probeString},
+	)
+	msg := dynamicpb.NewMessage(md)
+	// proto 的唯一键是 email，代码换成了 name：email 上的 max_length 成了键外声明
+	base := []TableOption{WithTableName("max_lengths_probe"), WithPrimaryKey("id"), WithUniqueKey("name")}
+
+	err := ValidateTableMessage(msg, base...)
+	if !errors.Is(err, ErrInvalidTableOption) {
+		t.Fatalf("键外字段上残留的 max_length 必须拒绝，实际: %v", err)
+	}
+	assertContainsAll(t, err.Error(), `"email"`, "WithMaxLengths 整体替换", "传 nil 即清空")
+
+	if err := ValidateTableMessage(msg, append(base, WithMaxLength("email", 0))...); !errors.Is(err, ErrInvalidTableOption) {
+		t.Fatalf("WithMaxLength(field, 0) 不是清除手段，必须仍被拒绝，实际: %v", err)
+	}
+
+	ddl, err := GenerateCreateTableSQLChecked(msg, append(base, WithMaxLengths(nil))...)
+	if err != nil {
+		t.Fatalf("WithMaxLengths(nil) 清空后应能建表: %v", err)
+	}
+	assertContainsAll(t, ddl,
+		"`email` MEDIUMTEXT COMMENT 'pb:2'", // 不在键里，回到默认映射
+		"`name` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+	)
+
+	// 覆盖语义：整体替换丢掉先前的合并结果，其后的 WithMaxLength 再合并进替换后的集合
+	for _, tc := range []struct {
+		name string
+		opts []TableOption
+		want string
+	}{
+		{"replace wins over earlier merge",
+			[]TableOption{WithMaxLength("name", 64), WithMaxLengths(map[string]uint32{"name": 100})}, "VARCHAR(100) "},
+		{"merge after replace",
+			[]TableOption{WithMaxLengths(map[string]uint32{"name": 100}), WithMaxLength("name", 32)}, "VARCHAR(32) "},
+		{"empty map clears everything",
+			[]TableOption{WithMaxLength("name", 64), WithMaxLengths(map[string]uint32{})}, "VARCHAR(191) "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			table := newMessageTable(msg, append(append([]TableOption{}, base...), tc.opts...)...)
+			if err := table.validateSchemaDefinition(); err != nil {
+				t.Fatalf("validateSchemaDefinition: %v", err)
+			}
+			if got := table.getMySQLFieldType(md.Fields().ByName("name")); !strings.HasPrefix(got, tc.want) {
+				t.Errorf("name 列类型 = %q, want prefix %q", got, tc.want)
+			}
+		})
+	}
+
+	// 传进来的 map 是调用方的：注册之后再改它不能影响已注册的表
+	lengths := map[string]uint32{"name": 100}
+	table := newMessageTable(msg, append(append([]TableOption{}, base...), WithMaxLengths(lengths))...)
+	lengths["name"] = 7
+	if got := table.getMySQLFieldType(md.Fields().ByName("name")); !strings.HasPrefix(got, "VARCHAR(100) ") {
+		t.Errorf("WithMaxLengths 必须拷贝入参，实际 %q", got)
+	}
+}
+
 // ── 表选项校验 ──────────────────────────────────────────────────────────
 
 func TestMaxLengthValidation(t *testing.T) {
@@ -410,9 +478,12 @@ func TestIndexKeyByteBudget(t *testing.T) {
 
 // ── 写入前的键值校验 ────────────────────────────────────────────────────
 
+// keyValueEntry 一个公开入口。矩阵覆盖的是"凡经过 serializeColumnValue 的入口"，
+// 少一个就等于那条路径上的超长键值没人拦。
 type keyValueEntry struct {
 	name   string
 	pkOnly bool // 只序列化主键的入口：唯一键列里的坏值不应拦住它
+	reads  bool // 先按主键读一次再写：唯一键列的坏值只能在那条 SELECT 之后拦下
 	run    func(pdb *DB, msg proto.Message) error
 }
 
@@ -425,53 +496,166 @@ func keyValueEntries(md protoreflect.MessageDescriptor) []keyValueEntry {
 		}
 		return b
 	}
+	idEq := "`id` = ?"
+	idArgs := []interface{}{uint64(1)}
 	return []keyValueEntry{
-		{"Insert", false, func(p *DB, m proto.Message) error { return p.Insert(m) }},
-		{"InsertIgnore", false, func(p *DB, m proto.Message) error { _, err := p.InsertIgnore(m); return err }},
-		{"Save", false, func(p *DB, m proto.Message) error { return p.Save(m) }},
-		{"Update", false, func(p *DB, m proto.Message) error { return p.Update(m) }},
-		{"BatchInsert", false, func(p *DB, m proto.Message) error { return p.BatchInsert([]proto.Message{valid, m}) }},
-		{"BatchSave", false, func(p *DB, m proto.Message) error { return p.BatchSave([]proto.Message{valid, m}) }},
-		{"UpdateFieldsByPK", true, func(p *DB, m proto.Message) error { return p.UpdateFieldsByPK(m, "note") }},
-		{"Delete", true, func(p *DB, m proto.Message) error { return p.Delete(m) }},
-		{"BatchDelete", true, func(p *DB, m proto.Message) error { return p.BatchDelete([]proto.Message{valid, m}) }},
-		{"FindOneByPK", true, func(p *DB, m proto.Message) error { return p.FindOneByPK(m) }},
-		{"ExistsByPK", true, func(p *DB, m proto.Message) error { _, err := p.ExistsByPK(m); return err }},
-		{"SQLBuilder.Insert", false, func(p *DB, m proto.Message) error { _, err := builder(p, m).Insert(m); return err }},
-		{"SQLBuilder.InsertSetFields", false, func(p *DB, m proto.Message) error { _, err := builder(p, m).InsertSetFields(m); return err }},
-		{"SQLBuilder.UpdateByPK", false, func(p *DB, m proto.Message) error { _, err := builder(p, m).UpdateByPK(m); return err }},
-		{"SQLBuilder.UpdateFieldsByPK", false, func(p *DB, m proto.Message) error {
+		{"Insert", false, false, func(p *DB, m proto.Message) error { return p.Insert(m) }},
+		{"InsertIgnore", false, false, func(p *DB, m proto.Message) error { _, err := p.InsertIgnore(m); return err }},
+		{"InsertReturningID", false, false, func(p *DB, m proto.Message) error { _, err := p.InsertReturningID(m); return err }},
+		{"InsertOnDupUpdate", false, false, func(p *DB, m proto.Message) error { return p.InsertOnDupUpdate(m) }},
+		{"Save", false, false, func(p *DB, m proto.Message) error { return p.Save(m) }},
+		{"Update", false, false, func(p *DB, m proto.Message) error { return p.Update(m) }},
+		{"UpdateByWhereWithArgs", false, false, func(p *DB, m proto.Message) error {
+			return p.UpdateByWhereWithArgs(m, idEq, idArgs)
+		}},
+		{"UpdateFieldsByPK", true, false, func(p *DB, m proto.Message) error { return p.UpdateFieldsByPK(m, "note") }},
+		{"UpdateFieldsByPK/key column", false, false, func(p *DB, m proto.Message) error {
+			return p.UpdateFieldsByPK(m, "token")
+		}},
+		{"UpdateKVByPK", true, false, func(p *DB, m proto.Message) error { return p.UpdateKVByPK(m, "note", "x") }},
+		{"UpdateIfVersion", false, false, func(p *DB, m proto.Message) error { _, err := p.UpdateIfVersion(m, "id"); return err }},
+		{"UpdateFieldsIfVersion", false, false, func(p *DB, m proto.Message) error {
+			_, err := p.UpdateFieldsIfVersion(m, "id", "token")
+			return err
+		}},
+		{"IncrByPK", true, false, func(p *DB, m proto.Message) error { return p.IncrByPK(m, "id", 1) }},
+		{"DecrByPKIfEnough", true, false, func(p *DB, m proto.Message) error { _, err := p.DecrByPKIfEnough(m, "id", 1); return err }},
+		{"Delete", true, false, func(p *DB, m proto.Message) error { return p.Delete(m) }},
+		{"FindOneByPK", true, false, func(p *DB, m proto.Message) error { return p.FindOneByPK(m) }},
+		{"FindOneByPKForUpdate", true, false, func(p *DB, m proto.Message) error {
+			return p.RunInTransaction(func(tx *DB) error { return tx.FindOneByPKForUpdate(m) })
+		}},
+		{"FindOrCreate", false, true, func(p *DB, m proto.Message) error { _, err := p.FindOrCreate(m); return err }},
+		{"ExistsByPK", true, false, func(p *DB, m proto.Message) error { _, err := p.ExistsByPK(m); return err }},
+		{"BatchInsert", false, false, func(p *DB, m proto.Message) error { return p.BatchInsert([]proto.Message{valid, m}) }},
+		{"BatchSave", false, false, func(p *DB, m proto.Message) error { return p.BatchSave([]proto.Message{valid, m}) }},
+		{"BatchDelete", true, false, func(p *DB, m proto.Message) error { return p.BatchDelete([]proto.Message{valid, m}) }},
+		{"SQLBuilder.Insert", false, false, func(p *DB, m proto.Message) error { _, err := builder(p, m).Insert(m); return err }},
+		{"SQLBuilder.InsertSetFields", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).InsertSetFields(m)
+			return err
+		}},
+		{"SQLBuilder.InsertIgnore", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).InsertIgnore(m)
+			return err
+		}},
+		{"SQLBuilder.InsertIgnoreSetFields", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).InsertIgnoreSetFields(m)
+			return err
+		}},
+		{"SQLBuilder.Replace", false, false, func(p *DB, m proto.Message) error { _, err := builder(p, m).Replace(m); return err }},
+		{"SQLBuilder.BatchInsert", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).BatchInsert([]proto.Message{valid, m})
+			return err
+		}},
+		{"SQLBuilder.BatchInsertIgnore", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).BatchInsertIgnore([]proto.Message{valid, m})
+			return err
+		}},
+		{"SQLBuilder.BatchReplace", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).BatchReplace([]proto.Message{valid, m})
+			return err
+		}},
+		{"SQLBuilder.Upsert", false, false, func(p *DB, m proto.Message) error { _, err := builder(p, m).Upsert(m); return err }},
+		{"SQLBuilder.UpsertAdd", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).UpsertAdd(m, "id")
+			return err
+		}},
+		{"SQLBuilder.UpsertKeepOld", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).UpsertKeepOld(m)
+			return err
+		}},
+		{"SQLBuilder.UpsertWith", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).UpsertWith(m, SetNew("note"))
+			return err
+		}},
+		{"SQLBuilder.BatchUpsert", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).BatchUpsert([]proto.Message{valid, m}, "note")
+			return err
+		}},
+		{"SQLBuilder.BatchUpsertWith", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).BatchUpsertWith([]proto.Message{valid, m}, SetNew("note"))
+			return err
+		}},
+		{"SQLBuilder.UpdateByPK", false, false, func(p *DB, m proto.Message) error { _, err := builder(p, m).UpdateByPK(m); return err }},
+		{"SQLBuilder.UpdateByPKIf", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).UpdateByPKIf(m, idEq, idArgs)
+			return err
+		}},
+		{"SQLBuilder.UpdateFieldsByPK", false, false, func(p *DB, m proto.Message) error {
 			_, err := builder(p, m).UpdateFieldsByPK(m, "token")
 			return err
 		}},
-		{"SQLBuilder.SelectByPK", true, func(p *DB, m proto.Message) error { _, err := builder(p, m).SelectByPK(m); return err }},
-		{"SQLBuilder.DeleteByPK", true, func(p *DB, m proto.Message) error { _, err := builder(p, m).DeleteByPK(m); return err }},
+		{"SQLBuilder.UpdateWhere", false, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).UpdateWhere(m, idEq, idArgs)
+			return err
+		}},
+		{"SQLBuilder.UpdateAssignsByPK", true, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).UpdateAssignsByPK(m, SetCol("note", "x"))
+			return err
+		}},
+		{"SQLBuilder.IncrByPK", true, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).IncrByPK(m, "id", 1)
+			return err
+		}},
+		{"SQLBuilder.DecrByPKIfEnough", true, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).DecrByPKIfEnough(m, "id", 1)
+			return err
+		}},
+		{"SQLBuilder.SelectByPK", true, false, func(p *DB, m proto.Message) error { _, err := builder(p, m).SelectByPK(m); return err }},
+		{"SQLBuilder.SelectByPKForUpdate", true, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).SelectByPKForUpdate(m)
+			return err
+		}},
+		{"SQLBuilder.ExistsByPKForUpdate", true, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).ExistsByPKForUpdate(m)
+			return err
+		}},
+		{"SQLBuilder.PrimaryKeyWhere", true, false, func(p *DB, m proto.Message) error {
+			_, _, err := builder(p, m).PrimaryKeyWhere(m)
+			return err
+		}},
+		{"SQLBuilder.DeleteByPK", true, false, func(p *DB, m proto.Message) error { _, err := builder(p, m).DeleteByPK(m); return err }},
+		{"SQLBuilder.DeleteByPKIf", true, false, func(p *DB, m proto.Message) error {
+			_, err := builder(p, m).DeleteByPKIf(m, idEq, idArgs)
+			return err
+		}},
 	}
 }
 
-func TestInvalidKeyValueRejectedBeforeSQL(t *testing.T) {
-	md := keyTableProbe(t)
-	opts := []TableOption{WithTableName("key_value_probe"), WithPrimaryKey("sub"), WithUniqueKey("token"),
-		WithMaxLength("sub", 8), WithMaxLength("token", 4)}
+// invalidKeyValue 一个放不进键列的值。DB 与 GORM 两条路径共用同一组坏值。
+type invalidKeyValue struct {
+	name   string
+	msg    *dynamicpb.Message
+	inPK   bool
+	want   []string
+	secret string // 错误信息不得回显的值
+}
 
-	invalid := []struct {
-		name   string
-		msg    *dynamicpb.Message
-		inPK   bool
-		want   []string
-		secret string // 错误信息不得回显的值
-	}{
+func invalidKeyValues(md protoreflect.MessageDescriptor, table string) []invalidKeyValue {
+	return []invalidKeyValue{
 		{"string longer than max_length", keyTableRow(md, "123456789", nil), true,
-			[]string{"key_value_probe", "sub", "9 个字符", "VARCHAR(8)"}, "123456789"},
+			[]string{table, "sub", "9 个字符", "VARCHAR(8)"}, "123456789"},
 		{"four-byte emoji counted per character", keyTableRow(md, strings.Repeat("😀", 9), nil), true,
 			[]string{"sub", "9 个字符", "VARCHAR(8)"}, "😀"},
 		{"invalid utf-8", keyTableRow(md, "ab\xffcd", nil), true,
 			[]string{"sub", "不是合法 UTF-8", "5 字节"}, ""},
 		{"bytes longer than max_length", keyTableRow(md, "ok", []byte("12345")), false,
-			[]string{"key_value_probe", "token", "5 字节", "VARBINARY(4)"}, "12345"},
+			[]string{table, "token", "5 字节", "VARBINARY(4)"}, "12345"},
 	}
+}
 
-	for _, bad := range invalid {
+// keyValueTableOptions 键值矩阵用的表定义：sub 是主键（≤8 个字符）、token 是唯一键（≤4 字节）。
+func keyValueTableOptions(table string) []TableOption {
+	return []TableOption{WithTableName(table), WithPrimaryKey("sub"), WithUniqueKey("token"),
+		WithMaxLength("sub", 8), WithMaxLength("token", 4)}
+}
+
+func TestInvalidKeyValueRejectedBeforeSQL(t *testing.T) {
+	md := keyTableProbe(t)
+	opts := keyValueTableOptions("key_value_probe")
+
+	for _, bad := range invalidKeyValues(md, "key_value_probe") {
 		for _, entry := range keyValueEntries(md) {
 			t.Run(bad.name+"/"+entry.name, func(t *testing.T) {
 				pdb, conn := newKeyProbeDB(t, bad.msg, opts...)
@@ -485,7 +669,7 @@ func TestInvalidKeyValueRejectedBeforeSQL(t *testing.T) {
 				if !errors.Is(err, ErrInvalidKeyValue) {
 					t.Fatalf("应返回 ErrInvalidKeyValue，实际: %v", err)
 				}
-				if got := conn.sqls(); len(got) != 0 {
+				if got := conn.sqls(); len(got) != 0 && !(entry.reads && !bad.inPK) {
 					t.Fatalf("键值校验必须发生在任何 SQL 之前，实际发出: %v", got)
 				}
 				assertContainsAll(t, err.Error(), bad.want...)
@@ -522,16 +706,23 @@ func TestKeyValueBoundariesAreAccepted(t *testing.T) {
 	}
 }
 
-// TestBatchKeyValidationCoversLaterChunks 分批入口不是原子的：第二批里的坏值必须在第一批
-// 发出之前就被拦下，否则调用方拿到错误时库里已经落了一半。
-func TestBatchKeyValidationCoversLaterChunks(t *testing.T) {
-	md := keyTableProbe(t)
-	opts := []TableOption{WithTableName("key_batch_probe"), WithPrimaryKey("sub"), WithMaxLength("sub", 8)}
+// batchKeyValidationMessages BatchInsertMaxSize+1 行、坏行在最后：坏值落在第二批，
+// 只有整批预检才拦得住它。
+func batchKeyValidationMessages(md protoreflect.MessageDescriptor) []proto.Message {
 	msgs := make([]proto.Message, BatchInsertMaxSize+1)
 	for i := range msgs {
 		msgs[i] = keyTableRow(md, fmt.Sprintf("k%d", i), nil)
 	}
 	msgs[len(msgs)-1] = keyTableRow(md, "123456789", nil)
+	return msgs
+}
+
+// TestBatchKeyValidationCoversLaterChunks 分批入口不是原子的：第二批里的坏值必须在第一批
+// 发出之前就被拦下，否则调用方拿到错误时库里已经落了一半。
+func TestBatchKeyValidationCoversLaterChunks(t *testing.T) {
+	md := keyTableProbe(t)
+	opts := []TableOption{WithTableName("key_batch_probe"), WithPrimaryKey("sub"), WithMaxLength("sub", 8)}
+	msgs := batchKeyValidationMessages(md)
 
 	for _, tc := range []struct {
 		name string
@@ -553,33 +744,113 @@ func TestBatchKeyValidationCoversLaterChunks(t *testing.T) {
 	}
 }
 
-func TestGormKeyValueRejectedBeforeSQL(t *testing.T) {
+// TestGormBatchKeyValidationCoversLaterChunks GORM 的分批入口与 core 同样不是原子的，
+// 坏值在最后一行时（第二批）必须在第一条语句发出之前就拦下。
+func TestGormBatchKeyValidationCoversLaterChunks(t *testing.T) {
 	md := keyTableProbe(t)
-	bad := keyTableRow(md, "123456789", nil)
-	valid := keyTableRow(md, "ok", nil)
+	msgs := batchKeyValidationMessages(md)
+
 	for _, tc := range []struct {
 		name string
 		run  func(*GormDB) error
 	}{
-		{"Insert", func(g *GormDB) error { return g.Insert(bad) }},
-		{"Save", func(g *GormDB) error { return g.Save(bad) }},
-		{"Update", func(g *GormDB) error { return g.Update(bad) }},
-		{"Delete", func(g *GormDB) error { return g.Delete(bad) }},
-		{"BatchInsert", func(g *GormDB) error { return g.BatchInsert([]proto.Message{valid, bad}) }},
-		{"BatchSave", func(g *GormDB) error { return g.BatchSave([]proto.Message{valid, bad}) }},
-		{"BatchDelete", func(g *GormDB) error { return g.BatchDelete([]proto.Message{valid, bad}) }},
+		{"BatchInsert", func(g *GormDB) error { return g.BatchInsert(msgs) }},
+		{"BatchDelete", func(g *GormDB) error { return g.BatchDelete(msgs) }},
+		{"BatchSave", func(g *GormDB) error { return g.BatchSave(msgs) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gdb, conn := newGormAuditDB(t)
-			gdb.RegisterTable(bad, WithTableName("gorm_key_probe"), WithPrimaryKey("sub"), WithMaxLength("sub", 8))
+			gdb.RegisterTable(msgs[0], WithTableName("gorm_key_batch_probe"), WithPrimaryKey("sub"), WithMaxLength("sub", 8))
 			before := len(conn.sqls())
 			if err := tc.run(gdb); !errors.Is(err, ErrInvalidKeyValue) {
-				t.Fatalf("GORM 路径同样必须返回 ErrInvalidKeyValue，实际: %v", err)
+				t.Fatalf("应返回 ErrInvalidKeyValue，实际: %v", err)
 			}
 			if got := conn.sqls()[before:]; len(got) != 0 {
-				t.Fatalf("GORM 路径的键值校验必须发生在 SQL 之前，实际发出: %v", got)
+				t.Fatalf("后面批次的坏值必须在第一条语句前拦下，实际发出 %d 条: %v", len(got), got)
 			}
 		})
+	}
+}
+
+// gormKeyValueEntry GormDB 侧的公开入口，语义与 keyValueEntry 相同。
+type gormKeyValueEntry struct {
+	name   string
+	pkOnly bool
+	reads  bool
+	run    func(gdb *GormDB, msg proto.Message) error
+}
+
+func gormKeyValueEntries(md protoreflect.MessageDescriptor) []gormKeyValueEntry {
+	valid := keyTableRow(md, "ok", []byte("ok"))
+	idEq := "`id` = ?"
+	idArgs := []interface{}{uint64(1)}
+	return []gormKeyValueEntry{
+		{"Insert", false, false, func(g *GormDB, m proto.Message) error { return g.Insert(m) }},
+		{"InsertIgnore", false, false, func(g *GormDB, m proto.Message) error { _, err := g.InsertIgnore(m); return err }},
+		{"InsertReturningID", false, false, func(g *GormDB, m proto.Message) error { _, err := g.InsertReturningID(m); return err }},
+		{"InsertOnDupUpdate", false, false, func(g *GormDB, m proto.Message) error { return g.InsertOnDupUpdate(m) }},
+		{"Save", false, false, func(g *GormDB, m proto.Message) error { return g.Save(m) }},
+		{"Update", false, false, func(g *GormDB, m proto.Message) error { return g.Update(m) }},
+		{"UpdateByWhereWithArgs", false, false, func(g *GormDB, m proto.Message) error {
+			return g.UpdateByWhereWithArgs(m, idEq, idArgs)
+		}},
+		{"UpdateFieldsByPK", true, false, func(g *GormDB, m proto.Message) error { return g.UpdateFieldsByPK(m, "note") }},
+		{"UpdateFieldsByPK/key column", false, false, func(g *GormDB, m proto.Message) error {
+			return g.UpdateFieldsByPK(m, "token")
+		}},
+		{"UpdateKVByPK", true, false, func(g *GormDB, m proto.Message) error { return g.UpdateKVByPK(m, "note", "x") }},
+		{"UpdateIfVersion", false, false, func(g *GormDB, m proto.Message) error { _, err := g.UpdateIfVersion(m, "id"); return err }},
+		{"UpdateFieldsIfVersion", false, false, func(g *GormDB, m proto.Message) error {
+			_, err := g.UpdateFieldsIfVersion(m, "id", "token")
+			return err
+		}},
+		{"IncrByPK", true, false, func(g *GormDB, m proto.Message) error { return g.IncrByPK(m, "id", 1) }},
+		{"DecrByPKIfEnough", true, false, func(g *GormDB, m proto.Message) error {
+			_, err := g.DecrByPKIfEnough(m, "id", 1)
+			return err
+		}},
+		{"Delete", true, false, func(g *GormDB, m proto.Message) error { return g.Delete(m) }},
+		{"FindOneByPK", true, false, func(g *GormDB, m proto.Message) error { return g.FindOneByPK(m) }},
+		{"FindOneByPKForUpdate", true, false, func(g *GormDB, m proto.Message) error {
+			return g.Transaction(func(tx *GormDB) error { return tx.FindOneByPKForUpdate(m) })
+		}},
+		{"FindOrCreate", false, true, func(g *GormDB, m proto.Message) error { _, err := g.FindOrCreate(m); return err }},
+		{"ExistsByPK", true, false, func(g *GormDB, m proto.Message) error { _, err := g.ExistsByPK(m); return err }},
+		{"BatchInsert", false, false, func(g *GormDB, m proto.Message) error { return g.BatchInsert([]proto.Message{valid, m}) }},
+		{"BatchSave", false, false, func(g *GormDB, m proto.Message) error { return g.BatchSave([]proto.Message{valid, m}) }},
+		{"BatchDelete", true, false, func(g *GormDB, m proto.Message) error { return g.BatchDelete([]proto.Message{valid, m}) }},
+	}
+}
+
+func TestGormKeyValueRejectedBeforeSQL(t *testing.T) {
+	md := keyTableProbe(t)
+	opts := keyValueTableOptions("gorm_key_probe")
+
+	for _, bad := range invalidKeyValues(md, "gorm_key_probe") {
+		for _, entry := range gormKeyValueEntries(md) {
+			t.Run(bad.name+"/"+entry.name, func(t *testing.T) {
+				gdb, conn := newGormAuditDB(t)
+				gdb.RegisterTable(bad.msg, opts...)
+				before := len(conn.sqls())
+				err := entry.run(gdb, bad.msg)
+				if !bad.inPK && entry.pkOnly {
+					if errors.Is(err, ErrInvalidKeyValue) {
+						t.Fatalf("只用主键的入口不应被唯一键列的值拦住: %v", err)
+					}
+					return
+				}
+				if !errors.Is(err, ErrInvalidKeyValue) {
+					t.Fatalf("GORM 路径同样必须返回 ErrInvalidKeyValue，实际: %v", err)
+				}
+				if got := conn.sqls()[before:]; len(got) != 0 && !(entry.reads && !bad.inPK) {
+					t.Fatalf("GORM 路径的键值校验必须发生在 SQL 之前，实际发出: %v", got)
+				}
+				assertContainsAll(t, err.Error(), bad.want...)
+				if bad.secret != "" && strings.Contains(err.Error(), bad.secret) {
+					t.Fatalf("错误信息不得回显键值: %v", err)
+				}
+			})
+		}
 	}
 }
 
@@ -645,16 +916,17 @@ func TestNewKeyTableSyncHasNoDrift(t *testing.T) {
 	}
 }
 
-// legacyStatements 从 ErrLegacyKeyColumn 的错误信息里取出迁移 SQL。
-func legacyStatements(t *testing.T, err error) []string {
+// sqlBlockAfter 从 ErrLegacyKeyColumn 的错误信息里取出某个 SQL 块：标题行之后每条语句独占一行、
+// 4 空格缩进、分号结尾，遇到不以 4 空格开头的行就结束。
+func sqlBlockAfter(t *testing.T, err error, header string) []string {
 	t.Helper()
 	text := err.Error()
-	idx := strings.Index(text, legacyKeySQLHeader)
+	idx := strings.Index(text, header)
 	if idx < 0 {
-		t.Fatalf("错误信息里没有迁移 SQL: %v", err)
+		t.Fatalf("错误信息里没有 %q 块: %v", header, err)
 	}
 	var statements []string
-	for _, line := range strings.Split(text[idx+len(legacyKeySQLHeader):], "\n") {
+	for _, line := range strings.Split(text[idx+len(header):], "\n") {
 		if line == "" {
 			continue
 		}
@@ -664,9 +936,21 @@ func legacyStatements(t *testing.T, err error) []string {
 		statements = append(statements, strings.TrimSuffix(strings.TrimSpace(line), ";"))
 	}
 	if len(statements) == 0 {
-		t.Fatalf("迁移 SQL 为空: %v", err)
+		t.Fatalf("%q 块为空: %v", header, err)
 	}
 	return statements
+}
+
+// legacyStatements 从 ErrLegacyKeyColumn 的错误信息里取出迁移 SQL。
+func legacyStatements(t *testing.T, err error) []string {
+	t.Helper()
+	return sqlBlockAfter(t, err, legacyKeySQLHeader)
+}
+
+// legacyChecks 从 ErrLegacyKeyColumn 的错误信息里取出执行前的人工核对查询。
+func legacyChecks(t *testing.T, err error) []string {
+	t.Helper()
+	return sqlBlockAfter(t, err, legacyKeyCheckSQLHeader)
 }
 
 func TestLegacyKeyColumnsFailClosedWithoutDDL(t *testing.T) {
@@ -686,7 +970,9 @@ func TestLegacyKeyColumnsFailClosedWithoutDDL(t *testing.T) {
 		opts       []TableOption
 		queue      [][][]driver.Value
 		wantReason string
+		wantHints  []string // 迁移步骤里必须出现的提示
 		wantSQL    []string
+		wantChecks []string // 人工核对查询里必须出现的片段
 	}{
 		{
 			name: "mediumtext unique key with 191 prefix",
@@ -713,10 +999,12 @@ func TestLegacyKeyColumnsFailClosedWithoutDDL(t *testing.T) {
 			queue: [][][]driver.Value{
 				rows(row(int64(1))),
 				golangCols(colRowFull("ip", "varchar(191)", 2, false, "", nil, "utf8mb4_unicode_ci"), false),
+				nil, // 主键里有键列：即使 proto 没声明二级索引也要读线上索引，这里线上一条都没有
 				rows(indexRow("PRIMARY", true, 1, "ip", nil)),
 			},
 			wantReason: "不区分大小写",
 			wantSQL: []string{
+				"SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), 'STRICT_ALL_TABLES')",
 				"CREATE TABLE `golang_test__p2m_new` (`id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1', " +
 					"`ip` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:2', ",
 				"PRIMARY KEY (`ip`)) ENGINE=InnoDB",
@@ -732,10 +1020,58 @@ func TestLegacyKeyColumnsFailClosedWithoutDDL(t *testing.T) {
 			queue: [][][]driver.Value{
 				rows(row(int64(1))),
 				golangCols(colRowFull("ip", "varchar(191)", 2, false, "", "", "utf8mb4_bin"), false),
+				nil,
 				rows(indexRow("PRIMARY", true, 1, "ip", nil)),
 			},
 			wantReason: "PAD SPACE",
 			wantSQL:    []string{"RENAME TABLE `golang_test` TO `golang_test__p2m_old`"},
+		},
+		{
+			// 线上列名与 proto 字段名不同（按 COMMENT 'pb:2' 的字段号匹配）：CHANGE COLUMN 改名与
+			// UPDATE 都必须用线上名字，重建的索引才引用得到改名后的列。
+			name: "renamed mediumtext column in unique key",
+			msg:  &testpb.GolangTest{},
+			opts: []TableOption{WithPrimaryKey("id"), WithUniqueKey("ip")},
+			queue: [][][]driver.Value{
+				rows(row(int64(1))),
+				golangCols(colRowFull("ip_addr", "mediumtext", 2, true, "", nil, "utf8mb4_unicode_ci"), true),
+				rows(
+					indexRow("uk_golang_test", true, 1, "ip_addr", int64(TextIndexPrefixLength)),
+					indexRow("idx_manual_ip", false, 1, "ip_addr", int64(100)),
+				),
+				rows(indexRow("PRIMARY", true, 1, "id", nil)),
+			},
+			wantReason: "TEXT 列只能建前缀索引",
+			wantHints:  []string{"列 ip_addr（唯一键）", "idx_manual_ip INDEX(1:ip_addr(100))", "人工重建"},
+			wantSQL: []string{
+				"ALTER TABLE `golang_test` DROP INDEX `uk_golang_test`",
+				"UPDATE `golang_test` SET `ip_addr` = '' WHERE `ip_addr` IS NULL",
+				"ALTER TABLE `golang_test` CHANGE COLUMN `ip_addr` `ip` VARCHAR(191) CHARACTER SET utf8mb4 " +
+					"COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:2'",
+				"ALTER TABLE `golang_test` ADD UNIQUE KEY `uk_golang_test` (`ip`)",
+			},
+			wantChecks: []string{"SELECT MAX(CHAR_LENGTH(`ip_addr`)) AS max_chars, SUM(`ip_addr` IS NULL) AS null_rows"},
+		},
+		{
+			// 主键路径的改名：INSERT ... SELECT 的源列用线上名字、目标列用 proto 名字；
+			// proto 未声明的孤儿列必须被点名，否则它们的数据只会留在旧表里。
+			name: "renamed varchar column in primary key",
+			msg:  &testpb.GolangTest{},
+			opts: []TableOption{WithPrimaryKey("ip"), WithAutoIncrementKey("")},
+			queue: [][][]driver.Value{
+				rows(row(int64(1))),
+				append(golangCols(colRowFull("addr", "varchar(191)", 2, false, "", nil, "utf8mb4_unicode_ci"), false),
+					colRowFull("legacy_note", "mediumtext", 0, true, "", nil, "utf8mb4_unicode_ci")),
+				nil,
+				rows(indexRow("PRIMARY", true, 1, "addr", nil)),
+			},
+			wantReason: "不区分大小写",
+			wantHints:  []string{"列 addr（主键）", "proto 未声明的列 [legacy_note]"},
+			wantSQL: []string{
+				"INSERT INTO `golang_test__p2m_new` (`id`, `ip`, `port`, `group_id`, `player`, `player_id`) " +
+					"SELECT `id`, `addr`, `port`, `group_id`, `player`, `player_id` FROM `golang_test`",
+			},
+			wantChecks: []string{"SELECT MAX(CHAR_LENGTH(`addr`)) AS max_chars"},
 		},
 		{
 			name: "mediumblob bytes unique key",
@@ -781,12 +1117,18 @@ func TestLegacyKeyColumnsFailClosedWithoutDDL(t *testing.T) {
 				}
 			}
 			assertContainsAll(t, err.Error(), tc.wantReason, "迁移步骤")
+			assertContainsAll(t, err.Error(), tc.wantHints...)
 			for _, generic := range []string{"nullable mismatch", "default mismatch", "definition mismatch"} {
 				if strings.Contains(err.Error(), generic) {
 					t.Errorf("旧形态列不应再报通用漂移 %q: %v", generic, err)
 				}
 			}
-			assertContainsAll(t, strings.Join(legacyStatements(t, err), "\n"), tc.wantSQL...)
+			statements := legacyStatements(t, err)
+			if statements[0] != strictModeSQL {
+				t.Errorf("迁移 SQL 第一条必须先把会话切成严格模式，实际: %s", statements[0])
+			}
+			assertContainsAll(t, strings.Join(statements, "\n"), tc.wantSQL...)
+			assertContainsAll(t, strings.Join(legacyChecks(t, err), "\n"), tc.wantChecks...)
 		})
 	}
 }
@@ -810,6 +1152,205 @@ func TestLegacyKeyColumnDetectionIgnoresIndexMetadata(t *testing.T) {
 	}
 	assertContainsAll(t, err.Error(), "列 ip", "mediumtext COLLATE utf8mb4_unicode_ci NULL",
 		"另有与这些键列无关的漂移", "column port nullable mismatch")
+}
+
+// ── 影子表重建 ──────────────────────────────────────────────────────────
+
+// legacyRebuildSync 跑一次同步，返回被拒绝的错误与假连接（用于断言发出的查询）。
+// 队列顺序即 readSchemaState 的读取顺序：表存在性 → 列 → 二级索引 → 主键。
+func legacyRebuildSync(t *testing.T, msg proto.Message, cols, indexes, primary [][]driver.Value, opts ...TableOption) (error, *fakeConn) {
+	t.Helper()
+	pdb, conn := newKeyProbeDB(t, msg, opts...)
+	queueLockedSchemaSync(conn, rows(row(int64(1))), cols, indexes, primary)
+	err := pdb.CreateOrUpdateTable(msg)
+	if !errors.Is(err, ErrLegacyKeyColumn) {
+		t.Fatalf("旧形态主键必须以 ErrLegacyKeyColumn 拒绝，实际: %v", err)
+	}
+	return err, conn
+}
+
+// TestLegacyRebuildKeepsUndeclaredIndexes 影子表必须把线上那些本库未声明的索引一起带过去：
+// RENAME 之后它们就没有第二次机会了。无法映射到影子表列的索引要被逐个点名，不能静默丢掉。
+func TestLegacyRebuildKeepsUndeclaredIndexes(t *testing.T) {
+	md := keyTableProbe(t)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"), // 旧形态主键
+		colRow("provider", "mediumtext", 2),
+		colRow("token", "mediumblob", 3),
+		colRow("id", "bigint unsigned", 4),
+		colRow("note", "mediumtext", 5),
+		colRow("tags", "mediumblob", 6),
+		colRowFull("legacy_col", "mediumtext", 0, true, "", nil, "utf8mb4_unicode_ci"),
+	)
+	indexes := rows(
+		indexRow("uk_manual_provider", true, 1, "provider", int64(TextIndexPrefixLength)),
+		indexRow("idx_manual_sub_id", false, 1, "sub", int64(TextIndexPrefixLength)),
+		indexRow("idx_manual_sub_id", false, 2, "id", nil),
+		indexRow("idx_manual_orphan", false, 1, "legacy_col", int64(TextIndexPrefixLength)),
+	)
+	err, _ := legacyRebuildSync(t, msg, cols, indexes, rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("rebuild_probe"), WithPrimaryKey("sub"))
+
+	create := legacyStatements(t, err)[1]
+	assertContainsAll(t, create,
+		// 线上定义原样保留：唯一性、列顺序、索引名，以及非键列上的前缀长度
+		"UNIQUE KEY `uk_manual_provider` (`provider`(191))",
+		// 旧形态键列在影子表里是 VARCHAR 整列，前缀长度必须去掉（否则 Error 1089）
+		"INDEX `idx_manual_sub_id` (`sub`,`id`)",
+	)
+	if strings.Contains(create, "idx_manual_orphan") {
+		t.Errorf("引用影子表没有的列的索引不能出现在建表语句里: %s", create)
+	}
+	assertContainsAll(t, err.Error(),
+		"无法自动重建", `idx_manual_orphan INDEX(1:legacy_col(191))`, `引用了影子表没有的列 "legacy_col"`,
+		"proto 未声明的列 [legacy_col]",
+		"本库未声明的索引 [idx_manual_sub_id uk_manual_provider]",
+	)
+	assertContainsAll(t, strings.Join(legacyChecks(t, err), "\n"),
+		"information_schema.REFERENTIAL_CONSTRAINTS", "REFERENCED_TABLE_NAME = 'rebuild_probe'",
+		"information_schema.TRIGGERS", "EVENT_OBJECT_TABLE = 'rebuild_probe'",
+	)
+}
+
+// TestLegacyRebuildReadsIndexesWithoutDeclaredOnes 主键里有 string/bytes 键列时，即使 proto 一条
+// 二级索引都没声明也必须读线上索引：影子表重建要靠它才不会丢索引。
+func TestLegacyRebuildReadsIndexesWithoutDeclaredOnes(t *testing.T) {
+	md := keyProbeDescriptor(t, "index_read_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "note", typ: probeString},
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"),
+		colRow("note", "mediumtext", 2),
+	)
+	err, conn := legacyRebuildSync(t, msg, cols,
+		rows(indexRow("uk_manual_note", true, 1, "note", int64(TextIndexPrefixLength))),
+		rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("index_read_probe"), WithPrimaryKey("sub"))
+
+	if n := conn.countSQL("INDEX_NAME <> 'PRIMARY'"); n != 1 {
+		t.Fatalf("主键里有键列时必须读一次线上二级索引，实际 %d 次: %v", n, conn.sqls())
+	}
+	assertContainsAll(t, legacyStatements(t, err)[1], "UNIQUE KEY `uk_manual_note` (`note`(191))")
+
+	// 元数据未知时不能假装索引不存在：必须明确要求人工 SHOW INDEX 核对
+	table := newMessageTable(msg, WithTableName("index_read_probe"), WithPrimaryKey("sub"))
+	unknown := table.validateSchemaDrift(map[string]columnMeta{
+		"sub":  {colType: "varchar(191)", fieldNum: 1, collation: "utf8mb4_unicode_ci", defaultValue: sql.NullString{String: "", Valid: true}, metadataComplete: true},
+		"note": {colType: "mediumtext", fieldNum: 2, nullable: true, metadataComplete: true},
+	}, nil, false, nil)
+	assertContainsAll(t, unknown.Error(), "没有读取线上二级索引", "SHOW INDEX FROM `index_read_probe`")
+}
+
+// TestLegacyRebuildKeepsOnlineColumnWidths 影子表不得把同步刻意保留得更宽的线上列收窄：
+// 按 proto 类型重建会让线上 bigint/LONGTEXT/更宽的键列在拷贝时截断（非严格模式）或中途失败。
+// 排序规则同理——影子表默认排序规则与线上不同时不写出来，比较语义会被静默改掉。
+func TestLegacyRebuildKeepsOnlineColumnWidths(t *testing.T) {
+	md := keyProbeDescriptor(t, "widen_shadow_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "count", typ: probeInt32},
+		keyProbeField{name: "note", typ: probeString},
+		keyProbeField{name: "provider", typ: probeString},
+	)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"), // 旧形态主键
+		colRowAttrsDefault("count", "bigint", 2, false, "", "0"),                   // 线上更宽
+		colRowFull("note", "longtext", 3, true, "", nil, "utf8mb4_bin"),            // 线上更宽 + 排序规则不同
+		colRowFull("provider", "varchar(255)", 4, false, "", "", KeyStringCollation),
+	)
+	err, _ := legacyRebuildSync(t, msg, cols,
+		rows(indexRow("uk_widen_shadow_probe", true, 1, "provider", nil)),
+		rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("widen_shadow_probe"), WithPrimaryKey("sub"), WithUniqueKey("provider"),
+		WithMaxLength("provider", 191))
+
+	assertContainsAll(t, legacyStatements(t, err)[1],
+		// 旧形态键列用目标类型：把它改成整列索引正是迁移的目的
+		"`sub` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:1'",
+		"`count` bigint NOT NULL DEFAULT 0 COMMENT 'pb:2'",
+		"`note` longtext COLLATE utf8mb4_bin COMMENT 'pb:3'",
+		"`provider` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:4'",
+	)
+	assertContainsAll(t, err.Error(), "不收窄", "`count` bigint", "`note` longtext COLLATE utf8mb4_bin", "`provider` varchar(255)")
+}
+
+// TestLegacyRebuildRebasesAutoIncrement 影子表的自增计数器只跟着拷进去的最大值走：
+// 旧表删过尾部行时（AUTO_INCREMENT=100001 而 MAX(id)=95000），不抬计数器就会把 id 重新发一遍。
+func TestLegacyRebuildRebasesAutoIncrement(t *testing.T) {
+	md := keyTableProbe(t)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"),
+		colRow("provider", "mediumtext", 2),
+		colRow("token", "mediumblob", 3),
+		colRowAttrs("id", "bigint unsigned", 4, false, "auto_increment"),
+		colRow("note", "mediumtext", 5),
+		colRow("tags", "mediumblob", 6),
+	)
+	indexes := rows(indexRow("idx_auto_inc_probe_0", false, 1, "id", nil))
+	primary := rows(indexRow("PRIMARY", true, 1, "sub", nil))
+	opts := []TableOption{WithTableName("auto_inc_probe"), WithPrimaryKey("sub"), WithIndexes("id")}
+
+	err, _ := legacyRebuildSync(t, msg, cols, indexes, primary, append(opts, WithAutoIncrementKey("id"))...)
+	statements := legacyStatements(t, err)
+	insertAt, renameAt := -1, -1
+	for i, stmt := range statements {
+		switch {
+		case strings.HasPrefix(stmt, "INSERT INTO"):
+			insertAt = i
+		case strings.HasPrefix(stmt, "RENAME TABLE"):
+			renameAt = i
+		}
+	}
+	if insertAt < 0 || renameAt < 0 || renameAt-insertAt != 7 {
+		t.Fatalf("抬计数器的语句必须整块夹在 INSERT 与 RENAME 之间，实际:\n%s", strings.Join(statements, "\n"))
+	}
+	assertContainsAll(t, strings.Join(statements[insertAt+1:renameAt], "\n"),
+		"/*!80000 SET SESSION information_schema_stats_expiry = 0 */",
+		"SET @p2m_auto_increment = COALESCE((SELECT AUTO_INCREMENT FROM information_schema.TABLES "+
+			"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'auto_inc_probe'), 1)",
+		"SET @p2m_rebase_sql = CONCAT('ALTER TABLE `auto_inc_probe__p2m_new` AUTO_INCREMENT = ', @p2m_auto_increment)",
+		"PREPARE p2m_rebase_auto_increment FROM @p2m_rebase_sql",
+		"EXECUTE p2m_rebase_auto_increment",
+		"DEALLOCATE PREPARE p2m_rebase_auto_increment",
+	)
+	assertContainsAll(t, err.Error(), "自增计数器抬到旧表的水位")
+
+	// 没有自增列的表不该多出这一步
+	noAutoInc, _ := legacyRebuildSync(t, msg, cols, indexes, primary, opts...)
+	if got := strings.Join(legacyStatements(t, noAutoInc), "\n"); strings.Contains(got, "AUTO_INCREMENT = ") {
+		t.Errorf("表没有 auto_increment_key 时不该抬计数器:\n%s", got)
+	}
+}
+
+// TestLegacyRebuildRejectsUndeclaredIndexOverBudget 旧形态键列去掉前缀长度后可能超过单个索引
+// 3072 字节的上限；这种索引重建不出来，必须点名而不是产出一条建表就报 Error 1071 的 SQL。
+func TestLegacyRebuildRejectsUndeclaredIndexOverBudget(t *testing.T) {
+	md := keyTableProbe(t)
+	msg := dynamicpb.NewMessage(md)
+	cols := rows(
+		colRowFull("sub", "varchar(191)", 1, false, "", nil, "utf8mb4_unicode_ci"),
+		colRow("provider", "mediumtext", 2),
+		colRow("token", "mediumblob", 3),
+		colRow("id", "bigint unsigned", 4),
+		colRow("note", "mediumtext", 5),
+		colRow("tags", "mediumblob", 6),
+	)
+	indexes := rows(
+		indexRow("idx_manual_wide", false, 1, "sub", int64(TextIndexPrefixLength)),
+		indexRow("idx_manual_wide", false, 2, "provider", int64(TextIndexPrefixLength)),
+	)
+	err, _ := legacyRebuildSync(t, msg, cols, indexes, rows(indexRow("PRIMARY", true, 1, "sub", nil)),
+		WithTableName("budget_probe"), WithPrimaryKey("sub"), WithUniqueKey("provider"),
+		WithMaxLength("sub", MaxKeyStringLength), WithMaxLength("provider", MaxKeyStringLength))
+
+	if create := legacyStatements(t, err)[1]; strings.Contains(create, "idx_manual_wide") {
+		t.Errorf("超过索引字节预算的索引不能进建表语句: %s", create)
+	}
+	assertContainsAll(t, err.Error(), "无法自动重建", "idx_manual_wide", "键长 6144 字节", "Error 1071")
 }
 
 func TestKeyColumnWideningGeneratesModifyWithCollation(t *testing.T) {

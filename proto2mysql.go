@@ -181,6 +181,17 @@ func (m *MessageTable) keyColumnKind(fieldDesc protoreflect.FieldDescriptor) (pr
 	return kind, m.isKeyColumnName(string(fieldDesc.Name()))
 }
 
+// primaryKeyHasKeyColumn 主键里有没有 string/bytes 键列。这类主键的线上形态可能是旧形态，
+// 而旧形态主键只能按影子表重建，重建要用到线上全部二级索引。
+func (m *MessageTable) primaryKeyHasKeyColumn() bool {
+	for _, name := range m.primaryKey {
+		if _, ok := m.keyColumnKind(m.Descriptor.Fields().ByName(protoreflect.Name(name))); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // keyColumnLength 键列的 N：string 按字符、bytes 按字节。
 func (m *MessageTable) keyColumnLength(fieldName string) uint32 {
 	if n, ok := m.maxLengths[fieldName]; ok {
@@ -992,19 +1003,41 @@ func (m *MessageTable) GetCreateTableSQL() string {
 	if err := m.validateSchemaDefinition(); err != nil {
 		return ""
 	}
-	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", escapeMySQLName(m.tableName))
-	fields := []string{}
-	indexes := []string{}
+	return m.buildCreateTableSQL(createTableSpec{ifNotExists: true}) + ";"
+}
+
+// defaultTableCollation 建表语句里的表级排序规则。影子表重建时要拿它判断"线上列的排序规则
+// 是不是表默认值"，所以不能再写成字面量散在两处。
+const defaultTableCollation = "utf8mb4_unicode_ci"
+
+// createTableSpec 建表语句里会随场景变化的部分，零值即 GetCreateTableSQL 的形态。
+// 影子表重建（见 legacyKeyRebuildSQL）要换表名、单行输出、按线上形态覆盖列类型并追加线上
+// 未声明的索引；那些都必须与建表走同一份生成逻辑，否则索引名、TiDB 方言块、表 COMMENT、
+// 字符集会在两处各写一遍并慢慢分叉。
+type createTableSpec struct {
+	tableName    string                                    // 目标表名；空则用 m.tableName（表 COMMENT 始终是 m.tableName）
+	ifNotExists  bool                                      // 加 IF NOT EXISTS
+	inline       bool                                      // 单行输出：迁移 SQL 块里一条语句占一行
+	columnType   func(protoreflect.FieldDescriptor) string // 列类型覆盖；nil 表示 getMySQLFieldType
+	extraIndexes []string                                  // 追加在声明索引之后的索引子句，如 "UNIQUE KEY `x` (`a`)"
+}
+
+func (m *MessageTable) buildCreateTableSQL(spec createTableSpec) string {
+	tableName := spec.tableName
+	if tableName == "" {
+		tableName = m.tableName
+	}
+	columnType := spec.columnType
+	if columnType == nil {
+		columnType = m.getMySQLFieldType
+	}
 
 	desc := m.Descriptor
+	entries := make([]string, 0, desc.Fields().Len()+len(m.indexes)+len(spec.extraIndexes)+2)
 	for i := 0; i < desc.Fields().Len(); i++ {
 		field := desc.Fields().Get(i)
-		fieldName := string(field.Name())
-		escapedName := escapeMySQLName(fieldName)
-
-		fieldType := m.getMySQLFieldType(field)
-
-		fields = append(fields, fmt.Sprintf("  %s %s%s", escapedName, fieldType, columnComment(field.Number())))
+		entries = append(entries, fmt.Sprintf("%s %s%s",
+			escapeMySQLName(string(field.Name())), columnType(field), columnComment(field.Number())))
 	}
 
 	if len(m.primaryKey) > 0 {
@@ -1012,47 +1045,42 @@ func (m *MessageTable) GetCreateTableSQL() string {
 		for i, pk := range m.primaryKey {
 			primaryKeys[i] = m.indexColumn(pk)
 		}
-		pkClause := fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(primaryKeys, ","))
+		pkClause := fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(primaryKeys, ","))
 		if m.tidbNonclusteredPK {
 			pkClause += tidbNonclusteredPKSQL
 		}
-		fields = append(fields, pkClause)
+		entries = append(entries, pkClause)
 	}
 
-	if len(m.indexes) > 0 {
-		for idx, indexCols := range m.indexes {
-			cols := strings.Split(indexCols, ",")
-			quotedCols := make([]string, len(cols))
-			for i, col := range cols {
-				quotedCols[i] = m.indexColumn(strings.TrimSpace(col))
-			}
-			indexName := m.indexNameFor(idx)
-			indexes = append(indexes, fmt.Sprintf("  INDEX %s (%s)", escapeMySQLName(indexName), strings.Join(quotedCols, ",")))
-		}
+	for idx, indexCols := range m.indexes {
+		entries = append(entries, fmt.Sprintf("INDEX %s (%s)",
+			escapeMySQLName(m.indexNameFor(idx)), m.indexColumnsSQL(indexCols)))
 	}
 
 	if m.uniqueKeys != "" {
-		uniqueCols := strings.Split(m.uniqueKeys, ",")
-		quotedUniqueCols := make([]string, len(uniqueCols))
-		for i, col := range uniqueCols {
-			name := strings.TrimSpace(col)
-			if m.needsIndexPrefix(name) {
+		for _, col := range splitTrimmed(m.uniqueKeys) {
+			if m.needsIndexPrefix(col) {
 				log.Printf("warning: unique key on TEXT/BLOB column %s in table %s only enforces "+
-					"uniqueness over the first %d characters", name, m.tableName, TextIndexPrefixLength)
+					"uniqueness over the first %d characters", col, m.tableName, TextIndexPrefixLength)
 			}
-			quotedUniqueCols[i] = m.indexColumn(name)
 		}
-		indexes = append(indexes, fmt.Sprintf("  UNIQUE KEY %s (%s)", escapeMySQLName(m.uniqueKeyName()), strings.Join(quotedUniqueCols, ",")))
+		entries = append(entries, fmt.Sprintf("UNIQUE KEY %s (%s)",
+			escapeMySQLName(m.uniqueKeyName()), m.indexColumnsSQL(m.uniqueKeys)))
 	}
+	entries = append(entries, spec.extraIndexes...)
 
-	stmt += strings.Join(fields, ",\n")
-	if len(indexes) > 0 {
-		stmt += ",\n" + strings.Join(indexes, ",\n")
+	open, glue, closing := " (\n  ", ",\n  ", "\n)"
+	if spec.inline {
+		open, glue, closing = " (", ", ", ")"
 	}
-
+	stmt := "CREATE TABLE "
+	if spec.ifNotExists {
+		stmt += "IF NOT EXISTS "
+	}
 	// 表注释简化为表名；TiDB 方言块按 TiDB 规范导出顺序放在 COMMENT 之前
-	stmt += "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci" + m.tidbTableOptionsSQL() + " COMMENT='" + escapeMySQLComment(m.tableName) + "';"
-	return stmt
+	return stmt + escapeMySQLName(tableName) + open + strings.Join(entries, glue) + closing +
+		" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=" + defaultTableCollation +
+		m.tidbTableOptionsSQL() + " COMMENT='" + escapeMySQLComment(m.tableName) + "'"
 }
 
 // tidbNonclusteredPKSQL 主键的 TiDB 非聚簇声明（含前导空格）。
@@ -2386,8 +2414,8 @@ func indexClauseReferencesAnyColumn(clause string, columns map[string]struct{}) 
 }
 
 // readSchemaState 读线上结构：列元信息，以及二级索引/主键的受支持校验维度。
-// indexesKnown 为 false 仅表示 proto 没声明二级索引、没有必要查询；需要查询却失败时
-// 必须返回错误，不能在元数据未知时继续 ADD 或宣告同步成功。
+// indexesKnown 为 false 仅表示 proto 没声明二级索引、也不会用到线上二级索引，没有必要查询；
+// 需要查询却失败时必须返回错误，不能在元数据未知时继续 ADD 或宣告同步成功。
 func (p *DB) readSchemaState(registryKey string, table *MessageTable) (
 	cols map[string]columnMeta, indexes map[string]indexMeta, indexesKnown bool, currentPK *indexMeta, err error,
 ) {
@@ -2396,7 +2424,10 @@ func (p *DB) readSchemaState(registryKey string, table *MessageTable) (
 		return nil, nil, false, nil, fmt.Errorf("获取表 %s 字段: %w", registryKey, err)
 	}
 
-	if len(table.indexes) > 0 || table.uniqueKeys != "" {
+	// 主键里有 string/bytes 键列时即使 proto 一条二级索引都没声明也要读：线上若是旧形态，
+	// 迁移只能走影子表重建（见 legacyKeyRebuildSQL），而影子表必须把线上那些本库未声明的
+	// 索引一起带过去，否则 RENAME 之后它们就没了。
+	if len(table.indexes) > 0 || table.uniqueKeys != "" || table.primaryKeyHasKeyColumn() {
 		indexes, err = p.existingIndexNames(table.tableName)
 		if err != nil {
 			return nil, nil, false, nil, fmt.Errorf("读取表 %s 的既有索引: %w", table.tableName, err)
@@ -4818,12 +4849,36 @@ func WithNullableFields(fields ...string) TableOption {
 // 按字段合并，不是整体替换：多次调用只覆盖同名字段，其它字段已有的长度保留，同一字段后应用的覆盖先应用的。
 // RegisterTable / NewSQLBuilder 先应用 proto 里声明的 max_length，再应用代码传入的选项，
 // 所以代码传入的值覆盖 proto 声明，而代码没提到的字段仍沿用 proto 声明。
+//
+// 代码改了主键/唯一键、proto 里的 max_length 落到了键外字段上时，用 WithMaxLengths 整体替换，
+// 合并语义清不掉 proto 的声明。
 func WithMaxLength(field string, n uint32) TableOption {
 	return func(t *MessageTable) {
 		if t.maxLengths == nil {
 			t.maxLengths = make(map[string]uint32)
 		}
 		t.maxLengths[field] = n
+	}
+}
+
+// WithMaxLengths 整体替换 max_length 集合（语义与 WithNullableFields 一致），nil 或空 map 表示清空。
+//
+// 为什么需要它：max_length 只允许声明在主键/唯一键的 string/bytes 字段上，而键是可以被代码
+// 改掉的——proto 在 email 上写了 max_length、代码却用 WithUniqueKey("name") 换掉了键之后，
+// email 上残留的声明会让 validateMaxLengths 以 ErrInvalidTableOption 拒绝整张表，
+// 且 WithMaxLength(email, 0) 同样越界被拒，按字段合并的语义清不掉它。
+//
+// 传入的 map 会被拷贝一份，调用方之后再改它不影响已注册的表。
+func WithMaxLengths(lengths map[string]uint32) TableOption {
+	return func(t *MessageTable) {
+		if len(lengths) == 0 {
+			t.maxLengths = nil
+			return
+		}
+		t.maxLengths = make(map[string]uint32, len(lengths))
+		for field, n := range lengths {
+			t.maxLengths[field] = n
+		}
 	}
 }
 

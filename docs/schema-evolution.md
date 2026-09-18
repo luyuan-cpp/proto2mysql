@@ -308,12 +308,26 @@ err = db.DumpMigrationSQLFile("migrations/0007_add_addr.sql", &pb.Player{}, &pb.
 都已在 MySQL 与 TiDB v8.5 上实测可以执行（见 `string_key_integration_test.go`，
 测试直接执行从错误信息里取出的 SQL，再同步验证零漂移）。
 
+SQL 分成两个块：
+
+- **执行前的人工核对**：只读查询，结果要人看过才能往下走（下面「预检」一节）。
+- **可直接执行的 SQL**：必须在**同一个会话**里按顺序逐条执行——块里有 `SET SESSION`、用户变量与
+  `PREPARE`，换一条连接（包括用连接池逐条 `Exec`）就丢了。
+
 ### 预检（两种形态都要做）
 
+核对查询已按实际表名、列名填好，形如：
+
 ```sql
-SELECT COUNT(*) FROM `t` WHERE `col` IS NULL;   -- 多于 1 行时，先人工给它们赋唯一值或删除；也不能与已有的 '' 撞
-SELECT MAX(CHAR_LENGTH(`col`)) FROM `t`;        -- string 列须 ≤ N；bytes 列用 MAX(LENGTH(`col`))
+-- 每个旧形态列一条：装不装得下、有多少行是 NULL
+SELECT MAX(CHAR_LENGTH(`col`)) AS max_chars, SUM(`col` IS NULL) AS null_rows, COUNT(*) AS rows_total
+  FROM `t` /* 目标列 col 上限 191 */;   -- bytes 列用 MAX(LENGTH(`col`))
 ```
+
+- `max_chars` / `max_bytes` 超过目标长度时先人工处理：迁移块第一条已经把会话切成严格模式
+  （`SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), 'STRICT_ALL_TABLES')`），
+  装不下是**报错中断**而不是静默截断——非严格模式下截断后的数据会被 `RENAME` 成正式表，不可回滚。
+- `null_rows` 多于 1 行时，先人工给它们赋唯一值或删除：NULL 改写成 `''` 后会互相撞键，也会与已有的 `''` 撞。
 
 从前缀唯一 / `*_ci` / PAD SPACE 换成整列、区分大小写、NO PAD，唯一性只会变宽松，已有数据不会因此出现新的重复；
 会撞键的只有 NULL 改写成 `''` 这一步。
@@ -324,6 +338,7 @@ SELECT MAX(CHAR_LENGTH(`col`)) FROM `t`;        -- string 列须 ≤ N；bytes �
 也不允许给仍带索引的列改排序规则（Error 8200）；前缀索引也不会随 MODIFY 自动变成整列索引。
 
 ```sql
+SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), 'STRICT_ALL_TABLES');
 ALTER TABLE `account` DROP INDEX `uk_account`;
 UPDATE `account` SET `provider_id` = '' WHERE `provider_id` IS NULL;
 ALTER TABLE `account` MODIFY COLUMN `provider_id` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:3';
@@ -331,7 +346,12 @@ ALTER TABLE `account` ADD UNIQUE KEY `uk_account` (`provider_id`);
 ```
 
 - 删索引到重建索引之间唯一性不受约束，请停写或在维护窗口执行。
-- 线上若另有包含该列、但不是本库声明的索引（错误信息会点名），TiDB 上也要先删掉才能 MODIFY，迁移后按需手工重建。
+- 线上若另有包含该列、但不是本库声明的索引，错误信息会带上它的定义（唯一性、列顺序、前缀长度）点名；
+  TiDB 上也要先 `DROP INDEX` 掉它们才能 MODIFY，迁移后按那份定义人工重建（本库不会替你动它们）。
+- 线上列名与 proto 字段名不同（按 `COMMENT 'pb:N'` 的字段号认出来）时，`MODIFY COLUMN` 会换成
+  `CHANGE COLUMN` 一步改名兼改类型，`UPDATE ... IS NULL` 用的也是线上那个名字。
+- 本次没有读取线上二级索引时（proto 一条索引都没声明、主键里也没有 string/bytes 键列），错误信息会明确要求
+  先 `SHOW INDEX` 核对，不会假装线上没有索引。
 
 ### 形态二：旧形态列在主键里——影子表重建
 
@@ -339,17 +359,42 @@ TiDB 聚簇主键既不能 `DROP PRIMARY KEY`，也不能改带索引列的排�
 建空表再 MODIFY 也一样是 Error 8200），所以按影子表重建，MySQL 与 TiDB 通用：
 
 ```sql
-CREATE TABLE `account__p2m_new` (`provider_id` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:1', `note` MEDIUMTEXT COMMENT 'pb:2', PRIMARY KEY (`provider_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='account';
-INSERT INTO `account__p2m_new` (`provider_id`, `note`) SELECT `provider_id`, `note` FROM `account`;
+SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), 'STRICT_ALL_TABLES');
+CREATE TABLE `account__p2m_new` (`provider_id` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:1', `note` longtext COMMENT 'pb:2', `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT 'pb:3', PRIMARY KEY (`provider_id`), INDEX `idx_account_0` (`id`), UNIQUE KEY `uk_manual_note` (`note`(191))) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='account';
+INSERT INTO `account__p2m_new` (`provider_id`, `note`, `id`) SELECT `provider_id`, `note`, `id` FROM `account`;
+/*!80000 SET SESSION information_schema_stats_expiry = 0 */;
+SET @p2m_auto_increment = COALESCE((SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'account'), 1);
+SET @p2m_rebase_sql = CONCAT('ALTER TABLE `account__p2m_new` AUTO_INCREMENT = ', @p2m_auto_increment);
+PREPARE p2m_rebase_auto_increment FROM @p2m_rebase_sql;
+EXECUTE p2m_rebase_auto_increment;
+DEALLOCATE PREPARE p2m_rebase_auto_increment;
 RENAME TABLE `account` TO `account__p2m_old`, `account__p2m_new` TO `account`;
 -- 核对数据无误后再手工 DROP TABLE `account__p2m_old`（本库不会替你删）
 ```
 
-- 建表语句就是本库为这张表生成的那条，只换了表名；索引名保持原表的 `idx_<表名>_N` / `uk_<表名>`，
-  RENAME 回来之后同步才认得出这些索引。
+- 建表语句与本库的建表走同一份生成逻辑（索引名、TiDB 方言块、表 COMMENT、字符集都一致），只换了表名；
+  索引名保持原表的 `idx_<表名>_N` / `uk_<表名>`，RENAME 回来之后同步才认得出这些索引。
+- **本库未声明的二级索引会被带进影子表**：线上存在、proto 没声明的索引（上例的 `uk_manual_note`）按线上定义
+  重建，保留原名、唯一性与列顺序；旧形态键列上的前缀长度会去掉（它在影子表里已是 `VARCHAR/VARBINARY` 整列，
+  前缀长度 ≥ 列宽会报 Error 1089），其它 TEXT/BLOB 列保留线上的 `SUB_PART`。引用了影子表没有的列、或去掉前缀
+  长度后超过单个索引 3072 字节的，无法重建，错误信息会逐个点名。`FULLTEXT`/`SPATIAL`、降序、不可见等属性不还原，
+  请按 `SHOW CREATE TABLE` 的输出人工核对。
+- **线上比 proto 更宽的列不收窄**：同步路径本来就不会把线上 `bigint`（proto `int32`）、`LONGTEXT`（proto
+  `MEDIUMTEXT`）改窄，影子表沿用同一条规则（上例的 `note` 保持 `longtext`），否则严格模式下迁移会中途失败、
+  非严格模式下截断后的数据会被 RENAME 成正式表。键列 `max_length` 调小时同理，保留线上宽度。被保留宽度的列
+  会在迁移步骤里点名。
+- **自增计数器要继承**：影子表的计数器只跟着拷进去的最大值走。旧表 `AUTO_INCREMENT=100001` 而 `MAX(id)=95000`
+  （删过尾部行）时，不抬计数器就会把 95001..100000 重新发一遍，撞上按旧 id 存下的外部引用。上面那几条
+  （`information_schema_stats_expiry` 只是绕开 MySQL 8 对 `information_schema.TABLES.AUTO_INCREMENT` 的
+  24 小时缓存；DDL 不接受表达式，所以用 `PREPARE`）在 MySQL 与 TiDB 上都实测可直接执行。
+- **RENAME 只搬表本身**：引用本表的外键会跟着指向 `account__p2m_old`，本表上的触发器也留在那边；`CHECK` 约束、
+  `FULLTEXT`/`SPATIAL` 索引、分区同样不进影子表。核对块里的 `information_schema.REFERENTIAL_CONSTRAINTS` 与
+  `information_schema.TRIGGERS` 查询就是用来发现它们的，RENAME 之后人工重建。
 - 影子表只含 proto 当前声明的列；线上多出来的列（错误信息会点名）要在执行前手工补进建表语句和 INSERT 列表，
   否则它们的数据只留在旧表里。
+- 线上列名与 proto 字段名不同时，`INSERT ... SELECT` 的目标列用 proto 名字、源列用线上名字，改名与迁移一步完成。
 - 可空的旧形态列在 SELECT 里会写成 `COALESCE(col, '')`。
+- 中途任何一步失败：先 `DROP TABLE account__p2m_new` 再从头执行（影子表还没接客，丢弃是安全的）。
 - TiDB 单个事务有大小上限，大表请分批拷贝。
 - 只在 MySQL 上、且只是排序规则不对（例如 `varchar(191) utf8mb4_unicode_ci` 主键）时，
   直接 `ALTER TABLE ... MODIFY COLUMN ... COLLATE utf8mb4_0900_bin` 也能原地完成（实测 MySQL 通过、TiDB 报 8200）。
@@ -358,7 +403,13 @@ RENAME TABLE `account` TO `account__p2m_old`, `account__p2m_new` TO `account`;
 
 ### 不可降级
 
-迁移后（以及新版本新建的表）键列是 `VARCHAR/VARBINARY`；旧版本进程同步时会按它自己的期望
-（`MEDIUMTEXT` + 191 前缀）报 `ErrSchemaDrift`。含字符串键的表一旦迁移，就不能再回滚到旧版本的库。
+迁移后（以及新版本新建的表）键列是 `VARCHAR/VARBINARY`；旧版本进程按它自己的映射
+（`MEDIUMTEXT`/`MEDIUMBLOB` + 191 前缀）处理，拦截点按键的位置不同：
+
+- string/bytes 在**主键**里：旧版本在注册/建表阶段就以 `ErrInvalidTableOption` 拒绝（`MEDIUMTEXT` 只能建
+  前缀索引，不能保证完整主键唯一性），`GetCreateTableSQL` 返回空串，根本到不了同步那一步。
+- string/bytes 只在**唯一键**里：旧版本能建表，同步时才按 `MEDIUMTEXT` + 191 前缀的期望报 `ErrSchemaDrift`。
+
+含字符串键的表一旦迁移，就不能再回滚到旧版本的库。
 另外，给已有多行数据的表**新增**非空 string 唯一键列时，旧行在新列上全是 `''`，补唯一键会撞 1062，
 需要先回填再加键（与新增数值唯一键列同类）。

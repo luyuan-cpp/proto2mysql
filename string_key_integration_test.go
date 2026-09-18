@@ -1,6 +1,7 @@
 package proto2mysql
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -312,12 +313,17 @@ func TestLegacyUniqueKeyMigrationRealDatabase(t *testing.T) {
 
 // TestLegacyPrimaryKeyMigrationRealDatabase varchar(191) utf8mb4_unicode_ci 主键（手工或旧工具建出）：
 // 同步拒绝且不改表；主键列只能按影子表重建，错误信息里的 SQL 必须在 MySQL 与 TiDB 上都能执行。
+//
+// 旧表刻意带上两样影子表最容易弄丢的东西：本库未声明的唯一索引与普通索引（RENAME 之后没有第二次
+// 机会），以及线上比 proto 更宽的列（bigint 存着超出 int32 的值，按 proto 类型重建会截断或失败）。
 func TestLegacyPrimaryKeyMigrationRealDatabase(t *testing.T) {
 	md := keyProbeDescriptor(t, "legacy_pk_it_probe",
 		keyProbeField{name: "sub", typ: probeString},
 		keyProbeField{name: "note", typ: probeString},
+		keyProbeField{name: "count", typ: probeInt32},
 	)
 	const table = "p2m_legacy_pk_probe"
+	const wideValue int64 = 9999999999 // 超出 int32
 	shadow, backup := table+"__p2m_new", table+"__p2m_old"
 	msg := dynamicpb.NewMessage(md)
 	pdb, db := openKeyProbeDB(t, msg, WithTableName(table), WithPrimaryKey("sub"))
@@ -325,11 +331,15 @@ func TestLegacyPrimaryKeyMigrationRealDatabase(t *testing.T) {
 	t.Cleanup(func() { dropKeyProbeTables(t, db, table, shadow, backup) })
 
 	if _, err := db.Exec("CREATE TABLE `" + table + "` (" +
-		"`sub` varchar(191) NOT NULL COMMENT 'pb:1', `note` MEDIUMTEXT COMMENT 'pb:2', PRIMARY KEY (`sub`)" +
+		"`sub` varchar(191) NOT NULL COMMENT 'pb:1', `note` MEDIUMTEXT COMMENT 'pb:2', " +
+		"`count` bigint NOT NULL DEFAULT 0 COMMENT 'pb:3', PRIMARY KEY (`sub`), " +
+		"UNIQUE KEY `uk_manual_note` (`note`(191)), KEY `idx_manual_count` (`count`)" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
 		t.Fatalf("建旧形态表: %v", err)
 	}
-	if _, err := db.Exec("INSERT INTO `" + table + "` (`sub`, `note`) VALUES ('AbC', 'x')"); err != nil {
+	// wide 行的 count 超出 int32，只能用裸 SQL 读回（本库解析 int32 字段时会拒绝它，这正是"线上更宽"的含义）
+	if _, err := db.Exec("INSERT INTO `"+table+"` (`sub`, `note`, `count`) VALUES ('AbC', 'x', 7), ('wide', 'w', ?)",
+		wideValue); err != nil {
 		t.Fatalf("写旧数据: %v", err)
 	}
 	if _, err := db.Exec("INSERT INTO `" + table + "` (`sub`, `note`) VALUES ('abc', 'y')"); err == nil {
@@ -338,6 +348,24 @@ func TestLegacyPrimaryKeyMigrationRealDatabase(t *testing.T) {
 
 	migrateLegacyKeyTable(t, pdb, db, msg, table)
 	assertKeyColumnShape(t, db, table, "sub", "varchar(191)", KeyStringCollation, "PRIMARY")
+
+	// 本库未声明的索引必须原样还在：定义（唯一性、列、前缀长度）也要对得上
+	for index, want := range map[string]string{
+		"uk_manual_note":   "UNIQUE(1:note(191))",
+		"idx_manual_count": "INDEX(1:count)",
+	} {
+		if got := keyProbeIndexDefinition(t, db, table, index); got != want {
+			t.Errorf("迁移后索引 %s = %q, want %q", index, got, want)
+		}
+	}
+	// 线上更宽的列不得被收窄：超出 int32 的值原样保留
+	var count int64
+	if err := db.QueryRow("SELECT `count` FROM `"+table+"` WHERE `sub` = ?", "wide").Scan(&count); err != nil {
+		t.Fatalf("读回 count: %v", err)
+	}
+	if count != wideValue {
+		t.Fatalf("线上 bigint 列被收窄了: count = %d, want %d", count, wideValue)
+	}
 
 	row := func(sub, note string) *dynamicpb.Message {
 		m := dynamicpb.NewMessage(md)
@@ -357,14 +385,121 @@ func TestLegacyPrimaryKeyMigrationRealDatabase(t *testing.T) {
 	}
 }
 
-// migrateLegacyKeyTable 同步必须以 ErrLegacyKeyColumn 拒绝且不动表结构；随后逐条执行错误信息里的
-// 迁移 SQL，再同步必须零漂移。
+// TestLegacyPrimaryKeyAutoIncrementMigrationRealDatabase 影子表必须继承旧表的自增计数器：
+// 旧表删过尾部行时（计数器远高于 MAX(id)），不抬计数器会把删掉的 id 重新发一遍。
+func TestLegacyPrimaryKeyAutoIncrementMigrationRealDatabase(t *testing.T) {
+	md := keyProbeDescriptor(t, "legacy_pk_autoinc_it_probe",
+		keyProbeField{name: "sub", typ: probeString},
+		keyProbeField{name: "id", typ: probeUint64},
+	)
+	const table = "p2m_legacy_pk_autoinc_probe"
+	shadow, backup := table+"__p2m_new", table+"__p2m_old"
+	msg := dynamicpb.NewMessage(md)
+	pdb, db := openKeyProbeDB(t, msg, WithTableName(table), WithPrimaryKey("sub"),
+		WithIndexes("id"), WithAutoIncrementKey("id"))
+	dropKeyProbeTables(t, db, table, shadow, backup)
+	t.Cleanup(func() { dropKeyProbeTables(t, db, table, shadow, backup) })
+
+	if _, err := db.Exec("CREATE TABLE `" + table + "` (" +
+		"`sub` varchar(191) NOT NULL COMMENT 'pb:1', " +
+		"`id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT 'pb:2', " +
+		"PRIMARY KEY (`sub`), KEY `idx_" + table + "_0` (`id`)" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
+		t.Fatalf("建旧形态表: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO `" + table + "` (`sub`) VALUES ('AbC'), ('def')"); err != nil {
+		t.Fatalf("写旧数据: %v", err)
+	}
+	// 把计数器抬高后再插一行、删掉它：这就是"尾部行被删过"的表，MAX(id) 远低于计数器
+	if _, err := db.Exec("ALTER TABLE `" + table + "` AUTO_INCREMENT = 100001"); err != nil {
+		t.Fatalf("抬高旧表计数器: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO `" + table + "` (`sub`) VALUES ('tail')"); err != nil {
+		t.Fatalf("写尾部行: %v", err)
+	}
+	var tailID uint64
+	if err := db.QueryRow("SELECT `id` FROM `"+table+"` WHERE `sub` = ?", "tail").Scan(&tailID); err != nil {
+		t.Fatalf("读尾部行 id: %v", err)
+	}
+	if tailID < 100001 {
+		t.Fatalf("抬高计数器没生效：尾部行 id = %d，前提不成立", tailID)
+	}
+	if _, err := db.Exec("DELETE FROM `"+table+"` WHERE `sub` = ?", "tail"); err != nil {
+		t.Fatalf("删尾部行: %v", err)
+	}
+
+	migrateLegacyKeyTable(t, pdb, db, msg, table)
+	assertKeyColumnShape(t, db, table, "sub", "varchar(191)", KeyStringCollation, "PRIMARY")
+
+	row := dynamicpb.NewMessage(md)
+	row.Set(md.Fields().ByName("sub"), protoreflect.ValueOfString("new"))
+	if err := pdb.Insert(row); err != nil {
+		t.Fatalf("迁移后插入新行: %v", err)
+	}
+	var newID uint64
+	if err := db.QueryRow("SELECT `id` FROM `"+table+"` WHERE `sub` = ?", "new").Scan(&newID); err != nil {
+		t.Fatalf("读回新行 id: %v", err)
+	}
+	if newID <= tailID {
+		t.Fatalf("影子表没继承计数器：新行 id = %d，删掉的尾部行 id = %d，被重新发了一遍", newID, tailID)
+	}
+}
+
+// TestLegacyRenamedKeyColumnMigrationRealDatabase 线上列名与 proto 字段名不同（按 COMMENT 'pb:N'
+// 的字段号匹配）时的唯一键迁移：CHANGE COLUMN 改名与类型必须在同一步，NULL 也要先改成空串。
+func TestLegacyRenamedKeyColumnMigrationRealDatabase(t *testing.T) {
+	md := keyProbeDescriptor(t, "legacy_rename_it_probe",
+		keyProbeField{name: "id", typ: probeUint64},
+		keyProbeField{name: "provider_id", typ: probeString},
+	)
+	const table = "p2m_legacy_rename_probe"
+	msg := dynamicpb.NewMessage(md)
+	pdb, db := openKeyProbeDB(t, msg, WithTableName(table), WithPrimaryKey("id"), WithUniqueKey("provider_id"))
+	dropKeyProbeTables(t, db, table)
+	t.Cleanup(func() { dropKeyProbeTables(t, db, table) })
+
+	// 线上列叫 pid，只有 COMMENT 'pb:2' 能证明它就是 provider_id
+	if _, err := db.Exec("CREATE TABLE `" + table + "` (\n" +
+		"  `id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',\n" +
+		"  `pid` MEDIUMTEXT COMMENT 'pb:2',\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  UNIQUE KEY `uk_" + table + "` (`pid`(191))\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='" + table + "'"); err != nil {
+		t.Fatalf("建旧形态表: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO `" + table + "` (`id`, `pid`) VALUES (1, 'AbC'), (2, NULL)"); err != nil {
+		t.Fatalf("写旧数据: %v", err)
+	}
+
+	migrateLegacyKeyTable(t, pdb, db, msg, table)
+	assertKeyColumnShape(t, db, table, "provider_id", "varchar(191)", KeyStringCollation, "uk_"+table)
+
+	var first, second string
+	if err := db.QueryRow("SELECT `provider_id` FROM `"+table+"` WHERE `id` = ?", 1).Scan(&first); err != nil {
+		t.Fatalf("读回 id=1: %v", err)
+	}
+	if err := db.QueryRow("SELECT `provider_id` FROM `"+table+"` WHERE `id` = ?", 2).Scan(&second); err != nil {
+		t.Fatalf("读回 id=2: %v", err)
+	}
+	if first != "AbC" || second != "" {
+		t.Fatalf("改名迁移后数据不对: id=1 %q, id=2 %q", first, second)
+	}
+	if _, err := db.Exec("SELECT `pid` FROM `" + table + "` LIMIT 1"); err == nil {
+		t.Fatal("旧列名 pid 应已随 CHANGE COLUMN 改掉")
+	}
+}
+
+// migrateLegacyKeyTable 同步必须以 ErrLegacyKeyColumn 拒绝且不动表结构；随后先跑一遍人工核对查询
+// （只验证它们在本后端上是合法 SQL，结果由人判断），再逐条执行迁移 SQL，最后同步必须零漂移。
+//
+// 迁移 SQL 必须钉在**同一条连接**上执行：块里有 SET SESSION、用户变量与 PREPARE，
+// 而 *sql.DB 是连接池，逐条 db.Exec 可能落在不同连接上，严格模式与计数器那几步就白做了。
 func migrateLegacyKeyTable(t *testing.T, pdb *DB, db *sql.DB, msg proto.Message, table string) {
 	t.Helper()
 	before := keyProbeSchema(t, db, table)
-	err := pdb.SyncAllTables()
-	if !errors.Is(err, ErrSchemaDrift) || !errors.Is(err, ErrLegacyKeyColumn) {
-		t.Fatalf("旧形态键列必须以 ErrSchemaDrift + ErrLegacyKeyColumn 拒绝，实际: %v", err)
+	syncErr := pdb.SyncAllTables()
+	if !errors.Is(syncErr, ErrSchemaDrift) || !errors.Is(syncErr, ErrLegacyKeyColumn) {
+		t.Fatalf("旧形态键列必须以 ErrSchemaDrift + ErrLegacyKeyColumn 拒绝，实际: %v", syncErr)
 	}
 	if after := keyProbeSchema(t, db, table); after != before {
 		t.Fatalf("拒绝同步时不得改动表结构\n--- before ---\n%s--- after ---\n%s", before, after)
@@ -373,12 +508,63 @@ func migrateLegacyKeyTable(t *testing.T, pdb *DB, db *sql.DB, msg proto.Message,
 		t.Fatalf("GenerateMigrationSQL 与同步走同一套规划，也必须拒绝，实际: %v", genErr)
 	}
 
-	statements := legacyStatements(t, err)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("取迁移用的专用连接: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	for _, query := range legacyChecks(t, syncErr) {
+		rows, queryErr := conn.QueryContext(context.Background(), query)
+		if queryErr != nil {
+			t.Fatalf("执行错误信息里的核对查询失败: %v\nSQL: %s", queryErr, query)
+		}
+		_ = rows.Close()
+	}
+
+	statements := legacyStatements(t, syncErr)
 	t.Logf("执行错误信息里的迁移 SQL:\n%s;", strings.Join(statements, ";\n"))
 	for _, stmt := range statements {
-		if _, execErr := db.Exec(stmt); execErr != nil {
-			t.Fatalf("执行错误信息里的迁移 SQL 失败: %v\nSQL: %s\n完整错误: %v", execErr, stmt, err)
+		if _, execErr := conn.ExecContext(context.Background(), stmt); execErr != nil {
+			t.Fatalf("执行错误信息里的迁移 SQL 失败: %v\nSQL: %s\n完整错误: %v", execErr, stmt, syncErr)
 		}
 	}
 	assertSyncsWithoutDrift(t, pdb, db, msg, table)
+}
+
+// keyProbeIndexDefinition 从 information_schema 回读一条索引的定义（唯一性 + 按序列号排好的列与前缀长度）。
+func keyProbeIndexDefinition(t *testing.T, db *sql.DB, table, index string) string {
+	t.Helper()
+	rows, err := db.Query("SELECT NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART FROM INFORMATION_SCHEMA.STATISTICS "+
+		"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? ORDER BY SEQ_IN_INDEX", table, index)
+	if err != nil {
+		t.Fatalf("读取索引 %s.%s: %v", table, index, err)
+	}
+	defer rows.Close()
+
+	unique := ""
+	var parts []string
+	for rows.Next() {
+		var nonUnique, sequence int
+		var column string
+		var subPart sql.NullInt64
+		if err := rows.Scan(&nonUnique, &sequence, &column, &subPart); err != nil {
+			t.Fatalf("扫描索引 %s.%s: %v", table, index, err)
+		}
+		unique = "INDEX"
+		if nonUnique == 0 {
+			unique = "UNIQUE"
+		}
+		if subPart.Valid {
+			column = fmt.Sprintf("%s(%d)", column, subPart.Int64)
+		}
+		parts = append(parts, fmt.Sprintf("%d:%s", sequence, column))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历索引 %s.%s: %v", table, index, err)
+	}
+	if unique == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s(%s)", unique, strings.Join(parts, ","))
 }

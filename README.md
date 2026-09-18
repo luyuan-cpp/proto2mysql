@@ -445,6 +445,10 @@ message third_party_account {
 - N 默认 191；`string` 取 1..768（按字符计），`bytes` 取 1..3072（按字节计）。proto 里写
   `[(proto2mysql.max_length) = 255]`，代码里用 `WithMaxLength("provider_id", 255)`（按字段合并，覆盖 proto 声明）。
 - `max_length` 目前只能写在主键/唯一键的 string/bytes 字段上；写在其它字段、显式写 0 或越界都返回 `ErrInvalidTableOption`。
+- 代码改掉键之后，proto 里的 `max_length` 可能落到键外字段上（proto 在 `email` 上写了 `max_length`，
+  代码却用 `WithUniqueKey("name")` 换掉了键），整张表会因此注册失败。这时用 `WithMaxLengths` 整体替换：
+  `WithMaxLength` 是按字段合并，清不掉 proto 的声明（`WithMaxLength("email", 0)` 是越界值，同样被拒），
+  `WithMaxLengths(nil)` 清空、`WithMaxLengths(map[string]uint32{...})` 用这一份取代全部声明。
 - 单个索引（主键、唯一键、每个普通索引**各自**计算）所有列合计不超过 3072 字节：`VARCHAR(N)` 按 4N 计、
   `VARBINARY(N)` 按 N 计，int32/uint32/enum/float 计 4，int64/uint64/double/Timestamp 计 8，bool 计 1，
   普通索引里不在键中的 string/bytes 走 191 前缀（分别计 764/191）。超出时建表前报错并列出每列占用。
@@ -461,8 +465,13 @@ message third_party_account {
 
 ### 限制
 
-- **不可降级**：新版本建出（或迁移后）的 `VARCHAR/VARBINARY` 键列，旧版本同步时会报 `ErrSchemaDrift`
-  （旧版本期望 `MEDIUMTEXT` + 191 前缀），含字符串键的表不能再回滚到旧版本。
+- **不可降级**：新版本建出（或迁移后）的 `VARCHAR/VARBINARY` 键列，旧版本按它自己的映射
+  （`MEDIUMTEXT`/`MEDIUMBLOB` + 191 前缀）处理，拦截点按键的位置不同：
+  - string/bytes 在**主键**里：旧版本在注册/建表阶段就以 `ErrInvalidTableOption` 拒绝（`MEDIUMTEXT` 只能建
+    前缀索引，不能做主键），`GetCreateTableSQL` 返回空串，根本到不了同步那一步。
+  - string/bytes 只在**唯一键**里：旧版本能建表，但同步到 `VARCHAR/VARBINARY` 列时报 `ErrSchemaDrift`。
+
+  两种都意味着含字符串键的表不能再回滚到旧版本。
 - 给已有多行数据的表**新增**一个非空 string 唯一键列时，旧行在新列上全是 `''`，补唯一键会撞 1062——
   与新增数值唯一键列（旧行全是 0）是同一类问题，需要先回填再加键。
 
@@ -470,7 +479,14 @@ message third_party_account {
 
 旧版本给唯一键里的 string 建的是 `MEDIUMTEXT` 可空列 + `(191)` 前缀索引。新版本同步到这类表（以及 `*_ci`、
 `utf8mb4_bin` 排序规则的 VARCHAR 键列）时返回 `ErrSchemaDrift` + `ErrLegacyKeyColumn`，**不执行任何 DDL**；
-错误信息里有逐列原因、迁移步骤和按实际表名填好的 SQL。步骤与实测过的 SQL 见
+错误信息里有逐列原因、迁移步骤，以及两个 SQL 块：先是结果要人工看过的只读核对查询（超长值、NULL 行数，
+影子表路径还查引用本表的外键与本表的触发器），然后是在**同一个会话**里按顺序逐条执行的迁移语句
+（第一条把会话切成严格模式，让装不下的值报错而不是静默截断）。
+
+旧形态列在主键里时只能按影子表重建（TiDB 聚簇主键不允许原地改），错误信息里的建表语句会：把线上存在、
+本库未声明的二级索引按原名原定义带进影子表；对线上比 proto 更宽的列（线上 `bigint` 而 proto `int32` 等）
+保留线上宽度不收窄；有自增列时把影子表的计数器抬到旧表的水位。无法重建的索引、`proto` 未声明的孤儿列、
+`RENAME` 之后需要人工重建的外键与触发器都会被逐个点名。步骤与实测过的 SQL 见
 [docs/schema-evolution.md](docs/schema-evolution.md#legacy-key-columns)。
 
 ## 配置选项
@@ -486,6 +502,8 @@ message third_party_account {
 - `WithAutoIncrementKey(key string)`: 设置自增字段
 - `WithNullableFields(fields ...string)`: 设置允许为 NULL 的字段（主键/唯一键里的 string/bytes 不能可空）
 - `WithMaxLength(field string, n uint32)`: 主键/唯一键里 string/bytes 字段的列宽，按字段合并，覆盖 proto 的 `max_length`
+- `WithMaxLengths(lengths map[string]uint32)`: 整体替换 `max_length` 集合（语义同 `WithNullableFields`），
+  传 nil 或空 map 即清空；代码改掉主键/唯一键、proto 的 `max_length` 落到了键外字段上时，只能用它清除
 - `WithTiDBNonclusteredPK()` / `WithTiDBShardRowIDBits(bits)` / `WithTiDBPreSplitRegions(n)` / `WithTiDBAutoIDCacheOne()`: TiDB 方言，见下节
 
 这些选项在 .proto 里都有等价写法（定义见 `proto/proto2mysql_option.proto`）：`table_name` / `primary_key` /

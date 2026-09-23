@@ -10,7 +10,7 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// 验证服务器 go/db/go.mod 明确依赖的本地主键类型修复，不连接 MySQL。
+// string/bytes 主键列映射为 VARCHAR(191)/VARBINARY(191) 的建表语句断言；只比对 DDL 文本，不连接 MySQL。
 func localKeyColumnMessage(t *testing.T) *dynamicpb.Message {
 	t.Helper()
 	fd, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{

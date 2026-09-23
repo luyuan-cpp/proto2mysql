@@ -155,6 +155,24 @@ func (m *MessageTable) getMySQLFieldType(fieldDesc protoreflect.FieldDescriptor)
 		baseType = "TEXT" // 默认类型
 	}
 
+	// string/bytes 主键列映射为 VARCHAR(191)/VARBINARY(191)，不用 MEDIUMTEXT/MEDIUMBLOB：
+	// TEXT/BLOB 列做主键必须带前缀长度，而前缀主键只保证前 191 个字符唯一，
+	// 前缀相同的两个长键会被判成重复。191 是 utf8mb4 下仍可建索引的长度；
+	// 列变成 VARCHAR 后 indexColumn 不再补前缀，主键按完整列比较。
+	// 只按完整字段名匹配主键（含复合主键），非主键列的存储不变。
+	for _, primaryKey := range m.primaryKey {
+		if primaryKey != fieldName {
+			continue
+		}
+		switch fieldDesc.Kind() {
+		case protoreflect.StringKind:
+			baseType = "VARCHAR(191)"
+		case protoreflect.BytesKind:
+			baseType = "VARBINARY(191)"
+		}
+		break
+	}
+
 	// 处理 nullable 字段
 	if m.isNullableField(fieldName) {
 		baseType = strings.ReplaceAll(baseType, " NOT NULL", "")

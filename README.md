@@ -14,8 +14,10 @@
 ## 安装
 
 ```bash
-go get github.com/your-username/proto2mysql
+go get github.com/luyuancpp/proto2mysql@v0.2.0
 ```
+
+v0.2.0 包含字符串键列与表结构同步的兼容性变化，升级前请阅读[发布说明](docs/release-notes-v0.2.0.md)。
 
 ## 快速开始
 
@@ -66,7 +68,7 @@ import (
 	"log"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/your-username/proto2mysql"
+	"github.com/luyuancpp/proto2mysql"
 	pb "your-module/example"
 )
 

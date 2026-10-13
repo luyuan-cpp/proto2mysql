@@ -73,6 +73,24 @@ PROTO2MYSQL_DSN="mysql://root:@127.0.0.1:14000/proto2mysql_test" \
 用例自己建表，结束时 DROP（包括影子表 `__p2m_new` 与备份表 `__p2m_old`）。
 多节点集群用例（`TestTiDBCluster*`）没有 `PROTO2MYSQL_TEST_DSN2` 时跳过属预期。
 
+### 带栅栏整行落库的真库用例（Go，v0.3.0 起）
+
+`conditional_save_integration_test.go` 的 4 条同样只在 `PROTO2MYSQL_INTEGRATION=1` 时跑，**MySQL 与 TiDB 都必须跑过、不得跳过**：
+
+| 用例 | 验什么 |
+|---|---|
+| `TestSaveConditionalRealDatabaseVersionSequence` | 插入 → 更新 → 旧版本与同版本被拒（`Stored` 正确）→ 新 epoch 从 seq 0 起 → `AllowEqual` 下整行相同报 Unchanged、内容不同报 Updated；2^53 与 2^53+1、MaxUint64−1 与 MaxUint64 能区分（参数不按 DOUBLE 比较）；`PreserveFields` 不清零栅栏 |
+| `TestSaveConditionalRealDatabaseAlternateUniqueConflict` | 撞备用唯一键返回 `ErrDuplicateKey`，被撞的行不变、冲突行不插入 |
+| `TestSaveConditionalRealDatabaseConcurrentWritersConvergeToNewest` | 20 个写者乱序并发写同一主键（分别从无行、有行开始），终态是最大版本的完整行，插入恰好一次 |
+| `TestSaveConditionalRealDatabaseInTransaction` | `RunInTransaction` 里被拒与更新各一次，提交后库内是更新后的值 |
+
+TiDB 上跑并发用例要求 `tidb_retry_limit > 0`（默认 10）：autocommit 语句走乐观事务，用例把 9007 / 1213 / 8002
+与 `ErrConditionalSaveRace` 一起当作可重试。「允许相等且整行相同」一步在 DSN 开了 `clientFoundRows` 时期望
+Updated 而不是 Unchanged，用例按配置自动切换。
+
+离线单测在 `conditional_save_test.go`，日常 `go test -count=1 ./...` 就会跑到；除 nullable 栅栏列一条只跑 core 外，
+其余都是 core 与 gorm 各跑一遍。
+
 ## 三、TiDB 的能力边界
 
 TiDB 把自己报成 `8.0.11-TiDB-v8.5.1`——**它声称自己是 MySQL 8.0**，

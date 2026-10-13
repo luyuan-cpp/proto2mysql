@@ -87,7 +87,7 @@ name=Bob, gold=100, level=42
 这叫 **丢失更新（lost update）**，也叫"陈旧对象覆盖"，**不是**数据库意义上的脏读。
 注意它跟版本无关：**同一个版本的两个进程并发跑，一样会发生。**
 
-### 四种正确姿势
+### 五种正确姿势
 
 | 场景 | 用什么 | 为什么 |
 |---|---|---|
@@ -95,6 +95,14 @@ name=Bob, gold=100, level=42
 | 金币 / 计数 / 库存 | `IncrByPK()` / `DecrByPKIfEnough()` | 数据库端原子加减，根本不需要先读 |
 | 必须检测冲突 | `UpdateIfVersion()` / `UpdateFieldsIfVersion()` | 乐观锁：版本对不上就返回 False，由你决定重试还是报错 |
 | 必须串行读-改-写 | 事务内 `FindOneByPKForUpdate()` | 悲观锁：`SELECT ... FOR UPDATE` 行锁，别人只能等 |
+| 多个写入方各带版本号写整行 | `SaveConditional()`（v0.3.0 起） | 栅栏：库内版本按字典序更旧才写，新版本永远不会被旧版本盖回去，与到达顺序无关 |
+
+> `SaveConditional` 的状态查询与整行比较一律 `FOR UPDATE`（current read）：autocommit 下锁只持续
+> 这一条语句；在 `RunInTransaction` 里会看到并锁住最新已提交的行，结局在事务**提交之后**才算成立。
+> 注意 REPEATABLE READ 下，事务里之后的普通 SELECT 仍读事务快照，可能比栅栏判定读到的值更旧，
+> 需要最新值请用 `FindOneByPKForUpdate`。
+> 显式事务里两个写者并发首插同一段主键间隙时可能返回 1213，须整体重试事务（与 `Save` 相同）。
+> TiDB 的显式事务请用悲观模式：乐观模式下 `FOR UPDATE` 不加锁，冲突要到 COMMIT 才报出来。
 
 ```go
 // ❌ 整行 Save：会把并发方改过的共同字段盖回旧值

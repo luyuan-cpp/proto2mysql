@@ -37,6 +37,7 @@
 | [concurrency.md](concurrency.md) | **P2MC 管什么、不管什么**：丢失更新 / 陈旧缓存 / 脏读幻读的边界 | 多进程写同一张表时 |
 | [testing.md](testing.md) | 怎么跑测试；真库/TiDB 集成测试怎么起；TiDB 的能力边界 | 改代码前后 |
 | [api-safety.md](api-safety.md) | 哪些方法安全、哪些会悄悄毁数据 | 写代码时当速查表 |
+| [release-notes-v0.3.0.md](release-notes-v0.3.0.md) | v0.3.0（草稿）：新增 `SaveConditional` 带栅栏的整行落库 | 多个进程会写同一行的不同版本时 |
 
 ## 名词表（本文档全篇通用）
 

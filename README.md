@@ -10,6 +10,7 @@
 - **类型处理**：内置支持 Protobuf 特殊类型（如 Timestamp）和集合类型（map/list）
 - **批量操作**：支持批量插入等高效操作，提升性能
 - **并发安全**：内部使用读写锁保证并发操作安全
+- **栅栏条件写**（v0.3.0 起）：`SaveConditional` 只在库内版本列更旧时整行写入，防止旧版本覆盖新数据，见 [docs/api-safety.md](docs/api-safety.md)
 
 ## 安装
 

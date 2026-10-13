@@ -24,6 +24,51 @@ current read 核对数据库当前行与目标的全部已知列；不会受 REP
 `Email` 当身份去更新别人，而会返回 `ErrDuplicateKey`；要按业务唯一键合并，请显式写
 带业务规则的 SQLBuilder upsert。
 
+### `SaveConditional` —— 带栅栏的整行落库（v0.3.0 起）
+
+同一行会被多个进程先后写入不同版本时用它：异步存盘队列被重放、旧属主进程假死后恢复。
+`Save` 是「后到者覆盖」，旧版本会把新数据整行盖回去；`SaveConditional` 让行自带一组单调递增的
+版本列（栅栏），**只有库内栅栏按字典序更旧时才写**，判断和写入是同一条 UPDATE。
+
+```go
+res, err := db.WithContext(ctx).SaveConditional(player, proto2mysql.SaveOptions{
+    FenceFields: []string{"owner_epoch", "save_seq"}, // 字典序：先比 epoch，再比 seq
+})
+switch {
+case err != nil:                              // 结局未知；ErrConditionalSaveRace 可重试
+case res.Outcome == proto2mysql.SaveRejected: // 库内更新或相等：res.Stored 是库内栅栏值，调用方自己判是重复还是过期
+default:                                      // SaveUpdated / SaveInserted / SaveUnchanged：res.Applied() == true
+}
+```
+
+| 选项 | 作用 |
+|---|---|
+| `FenceFields` | 栅栏列，只能是 uint32 / uint64、非主键、非 nullable、非自增。栅栏随整行写成消息里的值，所以只会前进 |
+| `AllowEqual` | 库内与消息相等也写（条件从 `<` 变成 `<=`）。给「同一版本可能重复写」的旧写入方用 |
+| `PreserveFields` | 更新已有行时不写这些列；插入新行时照常写。给不认识栅栏的旧写入方用，防止它把栅栏清零 |
+
+和 `UpdateIfVersion` 的区别：`UpdateIfVersion` 是「库内版本**等于**我读到的值才写，写完 +1」，
+用于读-改-写的冲突检测；`SaveConditional` 是「库内版本**小于**我手里的值才写」，用于多个写入方
+各自带着自己的版本号竞争同一行，谁新谁赢，与谁先到无关。
+
+⚠️ 用了栅栏的表：
+
+- **只能经 `SaveConditional` 写。** `Save` / `Update` 会把栅栏写成任意值。
+- **不要物理 DELETE。** 行没了，任何旧版本都会被当成新行插进来。
+- 常见路径的语句数：Updated 1 条；Rejected 2 条（多一条只取栅栏列的小查询）；Inserted / Unchanged 3 条。
+  并发插入撞 1062 时多一次重读，撞上并发写者时最多再来一轮。
+- 状态查询与整行比较**一律 `FOR UPDATE`**：强制读最新已提交值，也让读写分离中间件 / gorm dbresolver
+  把它留在主库——发到滞后的从库会把旧属主的重放误判成「已是目标值」。autocommit 下锁只持续一条语句。
+- 严格模式下消息栅栏全为 0 会直接返回 `ErrInvalidSaveOptions`（条件恒假，写入会被静默丢弃）。
+- `ErrConditionalSaveRace`：两轮内都撞上并发写者，单独重试这次调用即可。
+- `ErrSaveMatchMismatch`：两轮都做了整行比较、读到同一状态却改不动。多半是逐列比较与 MySQL 的
+  「值是否变化」判定不一致（例如线上列是 `DATETIME(0)` 而写入带小数秒），请核对表结构；只在栅栏相等
+  （`AllowEqual`）或不带栅栏时可能出现，偶发一次可重试，反复出现就是表结构问题。
+- 显式事务（默认 REPEATABLE READ）里两个写者并发首插同一段主键间隙时，InnoDB 可能返回 1213 并回滚
+  整个事务（`Save` 也一样），须**整体重试事务**；它不会被归为 `ErrConditionalSaveRace`。首写尽量在 autocommit 下做。
+- 依赖 `clientFoundRows=false`（go-sql-driver 默认）：开了它之后「条件成立但值没变」会报成 Updated
+  而不是 Unchanged，正确性不受影响。
+
 ### `update` —— 只写已赋值的字段
 
 ```go

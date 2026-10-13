@@ -352,9 +352,28 @@ type gormAuditQueryRule struct {
 type gormAuditConn struct {
 	mu         sync.Mutex
 	executed   []string
+	args       [][]driver.Value // 与 executed 一一对应
 	execQueue  []gormAuditExec
 	queryQueue []gormAuditQuery
 	queryRules []gormAuditQueryRule
+}
+
+// CheckNamedValue 只对精确类型 uint64 模拟 go-sql-driver/mysql 的直通。不实现它时，
+// database/sql 的默认转换器会把 uint64 转成 int64，并拒绝 >= 2^63 的值——测不到栅栏的真实参数类型。
+// 其它类型（含 *uint64、具名 uint64、返回 uint64 的 Valuer）返回 ErrSkip，仍走默认转换，不影响既有用例。
+func (c *gormAuditConn) CheckNamedValue(nv *driver.NamedValue) error {
+	if _, ok := nv.Value.(uint64); ok {
+		return nil
+	}
+	return driver.ErrSkip
+}
+
+func auditArgValues(named []driver.NamedValue) []driver.Value {
+	values := make([]driver.Value, len(named))
+	for i, arg := range named {
+		values[i] = arg.Value
+	}
+	return values
 }
 
 func (c *gormAuditConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
@@ -364,10 +383,11 @@ func (c *gormAuditConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, e
 	return gormAuditTx{}, nil
 }
 
-func (c *gormAuditConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+func (c *gormAuditConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.executed = append(c.executed, query)
+	c.args = append(c.args, auditArgValues(args))
 	step := gormAuditExec{affected: 1}
 	if len(c.execQueue) > 0 {
 		step, c.execQueue = c.execQueue[0], c.execQueue[1:]
@@ -378,10 +398,11 @@ func (c *gormAuditConn) ExecContext(_ context.Context, query string, _ []driver.
 	return gormAuditResult{affected: step.affected, lastID: step.lastID}, nil
 }
 
-func (c *gormAuditConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *gormAuditConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.executed = append(c.executed, query)
+	c.args = append(c.args, auditArgValues(args))
 	for _, rule := range c.queryRules {
 		if strings.Contains(query, rule.contains) {
 			if rule.result.err != nil {
@@ -404,6 +425,23 @@ func (c *gormAuditConn) queueExec(steps ...gormAuditExec) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.execQueue = append(c.execQueue, steps...)
+}
+
+// queueQuery 按执行顺序排队查询结果；没有命中 addQueryRule 的查询依次取用。
+func (c *gormAuditConn) queueQuery(results ...gormAuditQuery) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queryQueue = append(c.queryQueue, results...)
+}
+
+// argsAt 返回第 i 条语句（含查询）实际收到的参数。
+func (c *gormAuditConn) argsAt(i int) []driver.Value {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if i < 0 || i >= len(c.args) {
+		return nil
+	}
+	return append([]driver.Value(nil), c.args[i]...)
 }
 
 func (c *gormAuditConn) addQueryRule(contains string, result gormAuditQuery) {
@@ -472,3 +510,4 @@ var _ driver.Connector = (*gormAuditDriver)(nil)
 var _ driver.ExecerContext = (*gormAuditConn)(nil)
 var _ driver.QueryerContext = (*gormAuditConn)(nil)
 var _ driver.ConnBeginTx = (*gormAuditConn)(nil)
+var _ driver.NamedValueChecker = (*gormAuditConn)(nil)
